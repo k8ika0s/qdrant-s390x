@@ -8,6 +8,7 @@ on:
 
 jobs:
   build-linux-binaries:
+    continue-on-error: ${{ matrix.target == 's390x-unknown-linux-gnu' }}
     strategy:
       matrix:
         include:
@@ -18,6 +19,9 @@ jobs:
             os: ubuntu-latest
 
           - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+
+          - target: s390x-unknown-linux-gnu
             os: ubuntu-latest
     runs-on: ${{ matrix.os }}
     steps:
@@ -39,7 +43,7 @@ jobs:
       - name: Install cross-compilation tools
         with:
           target: ${{ matrix.target }}
-        if: startsWith(matrix.os, 'ubuntu') && contains(matrix.target, '-musl')
+        if: startsWith(matrix.os, 'ubuntu') && (contains(matrix.target, '-musl') || matrix.target == 's390x-unknown-linux-gnu')
         uses: taiki-e/setup-cross-toolchain-action@v1
       - name: Build and publish
         uses: taiki-e/upload-rust-binary-action@v1
