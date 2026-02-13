@@ -4,6 +4,12 @@
 
 ## Build Qdrant
 
+### Persistence format changes
+
+When changing persisted formats (mmap/index/snapshot/segment files), follow the explicit endianness contract in:
+
+- [Persistence Endianness Policy](./PERSISTENCE_ENDIANNESS.md)
+
 ### Docker 🐳
 
 Build your own from source

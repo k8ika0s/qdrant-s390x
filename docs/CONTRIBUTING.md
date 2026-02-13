@@ -15,9 +15,10 @@ Pull requests are the best way to propose changes to the codebase (we use [GitHu
 1. Fork the repo and create your branch from `dev`.
 2. If you've added code that should be tested, add tests.
 3. If you've changed APIs, update the documentation and API Schema definitions (see [development docs](https://github.com/qdrant/qdrant/blob/master/docs/DEVELOPMENT.md#api-changes))
-4. Ensure the test suite passes.
-5. Make sure your code lints (with cargo).
-6. Issue that pull request!
+4. If you've changed persisted data formats (mmap/index/snapshot/segment files), follow the [persistence endianness policy](https://github.com/qdrant/qdrant/blob/master/docs/PERSISTENCE_ENDIANNESS.md).
+5. Ensure the test suite passes.
+6. Make sure your code lints (with cargo).
+7. Issue that pull request!
 
 ## Any contributions you make will be under the Apache License 2.0
 In short, when you submit code changes, your submissions are understood to be under the same [Apache License 2.0](https://choosealicense.com/licenses/apache-2.0/) that covers the project. Feel free to contact the maintainers if that's a concern.
@@ -46,4 +47,3 @@ so please ensure running ``cargo clippy --workspace --all-features`` before subm
 
 ## License
 By contributing, you agree that your contributions will be licensed under its Apache License 2.0.
-
