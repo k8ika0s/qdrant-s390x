@@ -24,22 +24,19 @@ pub trait StableHash {
 
 impl StableHash for i32 {
     fn stable_hash<W: FnMut(&[u8])>(&self, write: &mut W) {
-        // WARN: endianess-dependent; keep for backward compatibility
-        write(&self.to_ne_bytes());
+        write(&self.to_le_bytes());
     }
 }
 
 impl StableHash for u32 {
     fn stable_hash<W: FnMut(&[u8])>(&self, write: &mut W) {
-        // WARN: endianess-dependent; keep for backward compatibility
-        write(&self.to_ne_bytes());
+        write(&self.to_le_bytes());
     }
 }
 
 impl StableHash for u64 {
     fn stable_hash<W: FnMut(&[u8])>(&self, write: &mut W) {
-        // WARN: endianess-dependent; keep for backward compatibility
-        write(&self.to_ne_bytes());
+        write(&self.to_le_bytes());
     }
 }
 
@@ -70,5 +67,34 @@ pub struct StableHashed<T: StableHash>(pub T);
 impl<T: StableHash> Hash for StableHashed<T> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.0.stable_hash(&mut |bytes| state.write(bytes));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StableHash;
+
+    #[test]
+    fn stable_hash_u32_is_little_endian() {
+        let value = 0x0102_0304_u32;
+        let mut out = Vec::new();
+        value.stable_hash(&mut |bytes| out.extend_from_slice(bytes));
+        assert_eq!(out, [0x04, 0x03, 0x02, 0x01]);
+    }
+
+    #[test]
+    fn stable_hash_i32_is_little_endian() {
+        let value = 0x1122_3344_i32;
+        let mut out = Vec::new();
+        value.stable_hash(&mut |bytes| out.extend_from_slice(bytes));
+        assert_eq!(out, [0x44, 0x33, 0x22, 0x11]);
+    }
+
+    #[test]
+    fn stable_hash_u64_is_little_endian() {
+        let value = 0x0102_0304_0506_0708_u64;
+        let mut out = Vec::new();
+        value.stable_hash(&mut |bytes| out.extend_from_slice(bytes));
+        assert_eq!(out, [0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
     }
 }
