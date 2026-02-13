@@ -55,16 +55,19 @@ ARG MOLD_VERSION=2.40.4
 RUN case "$BUILDPLATFORM" in \
         */amd64 ) PLATFORM=x86_64 ;; \
         */arm64 | */arm64/* ) PLATFORM=aarch64 ;; \
-        * ) echo "Unexpected BUILDPLATFORM '$BUILDPLATFORM'" >&2; exit 1 ;; \
+        * ) PLATFORM= ;; \
     esac; \
     \
-    mkdir -p /opt/mold; \
-    cd /opt/mold; \
-    \
-    TARBALL="mold-$MOLD_VERSION-$PLATFORM-linux.tar.gz"; \
-    curl -sSLO "https://github.com/rui314/mold/releases/download/v$MOLD_VERSION/$TARBALL"; \
-    tar -xf "$TARBALL" --strip-components 1; \
-    rm "$TARBALL"
+    mkdir -p /opt/mold/bin; \
+    if [ -n "$PLATFORM" ]; then \
+      cd /opt/mold; \
+      TARBALL="mold-$MOLD_VERSION-$PLATFORM-linux.tar.gz"; \
+      curl -sSLO "https://github.com/rui314/mold/releases/download/v$MOLD_VERSION/$TARBALL"; \
+      tar -xf "$TARBALL" --strip-components 1; \
+      rm "$TARBALL"; \
+    else \
+      echo "Skipping mold installation for BUILDPLATFORM '$BUILDPLATFORM'"; \
+    fi
 
 # `ARG`/`ENV` pair is a workaround for `docker build` backward-compatibility.
 #
@@ -110,7 +113,9 @@ COPY --from=planner /qdrant/recipe.json recipe.json
 # https://github.com/tonistiigi/xx/pull/108
 RUN PKG_CONFIG="/usr/bin/$(xx-info)-pkg-config" \
     PATH="$PATH:/opt/mold/bin" \
-    RUSTFLAGS="${LINKER:+-C link-arg=-fuse-ld=}$LINKER ${TARGET_CPU:+-C target-cpu=}$TARGET_CPU $RUSTFLAGS" \
+    EFFECTIVE_LINKER="$LINKER" \
+    && if [ "$EFFECTIVE_LINKER" = "mold" ] && [ ! -x /opt/mold/bin/mold ]; then EFFECTIVE_LINKER=; fi \
+    && RUSTFLAGS="${EFFECTIVE_LINKER:+-C link-arg=-fuse-ld=}$EFFECTIVE_LINKER ${TARGET_CPU:+-C target-cpu=}$TARGET_CPU $RUSTFLAGS" \
     ${JEMALLOC_SYS_WITH_LG_PAGE:+env JEMALLOC_SYS_WITH_LG_PAGE="${JEMALLOC_SYS_WITH_LG_PAGE}"} \
     xx-cargo chef cook --profile $PROFILE ${FEATURES:+--features} $FEATURES --features=stacktrace ${GPU:+--features=gpu} --recipe-path recipe.json
 
@@ -123,7 +128,9 @@ ARG GIT_COMMIT_ID
 # https://github.com/tonistiigi/xx/pull/108
 RUN PKG_CONFIG="/usr/bin/$(xx-info)-pkg-config" \
     PATH="$PATH:/opt/mold/bin" \
-    RUSTFLAGS="${LINKER:+-C link-arg=-fuse-ld=}$LINKER ${TARGET_CPU:+-C target-cpu=}$TARGET_CPU $RUSTFLAGS" \
+    EFFECTIVE_LINKER="$LINKER" \
+    && if [ "$EFFECTIVE_LINKER" = "mold" ] && [ ! -x /opt/mold/bin/mold ]; then EFFECTIVE_LINKER=; fi \
+    && RUSTFLAGS="${EFFECTIVE_LINKER:+-C link-arg=-fuse-ld=}$EFFECTIVE_LINKER ${TARGET_CPU:+-C target-cpu=}$TARGET_CPU $RUSTFLAGS" \
     ${JEMALLOC_SYS_WITH_LG_PAGE:+env JEMALLOC_SYS_WITH_LG_PAGE="${JEMALLOC_SYS_WITH_LG_PAGE}"} \
     xx-cargo build --profile $PROFILE ${FEATURES:+--features} $FEATURES --features=stacktrace ${GPU:+--features=gpu} --bin qdrant \
     && PROFILE_DIR=$(if [ "$PROFILE" = dev ]; then echo debug; else echo $PROFILE; fi) \
