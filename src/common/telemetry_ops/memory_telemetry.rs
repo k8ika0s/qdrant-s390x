@@ -57,4 +57,12 @@ impl MemoryTelemetry {
     pub fn collect(_auth: &Auth) -> Option<MemoryTelemetry> {
         None
     }
+
+    #[cfg(all(
+        not(target_env = "msvc"),
+        not(any(target_arch = "x86_64", target_arch = "aarch64"))
+    ))]
+    pub fn collect(_auth: &Auth) -> Option<MemoryTelemetry> {
+        None
+    }
 }
