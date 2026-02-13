@@ -49,6 +49,34 @@ jobs:
         name: junit-${{ matrix.os }}.xml
         path: target/nextest/ci/junit.xml
 
+  s390x-check:
+    name: s390x check (informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+
+    steps:
+    - name: Install stable with s390x target
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: s390x-unknown-linux-gnu
+    - uses: actions/checkout@v6
+    - uses: Swatinem/rust-cache@v2
+    - name: Install Protoc
+      uses: arduino/setup-protoc@v3
+      with:
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
+    - name: Run cargo check for s390x
+      shell: bash
+      run: |
+        set -o pipefail
+        cargo check -p qdrant --target s390x-unknown-linux-gnu --locked 2>&1 | tee s390x-check.log
+    - name: Upload s390x check log
+      if: always()
+      uses: actions/upload-artifact@v6
+      with:
+        name: s390x-check.log
+        path: s390x-check.log
+
   # After tests are run, this hacky script will process the JUnit output of nextest
   # and will create a GH Issue if there is a test marked as flaky,
   # Failure of updating an issue is ignored because it fails for external contributors.
