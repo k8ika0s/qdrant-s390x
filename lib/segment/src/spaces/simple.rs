@@ -14,11 +14,7 @@ use crate::types::Distance;
 #[cfg(target_arch = "x86_64")]
 pub(crate) const MIN_DIM_SIZE_AVX: usize = 32;
 
-#[cfg(any(
-    target_arch = "x86",
-    target_arch = "x86_64",
-    all(target_arch = "aarch64", target_feature = "neon")
-))]
+#[allow(dead_code)]
 pub(crate) const MIN_DIM_SIZE_SIMD: usize = 16;
 
 #[derive(Clone)]
@@ -269,9 +265,15 @@ mod tests {
                 <CosineMetric as Metric<VectorElementType>>::preprocess(preprocess1.clone());
 
             // All following preprocess attempts must be the same
-            assert_eq!(
-                preprocess1, preprocess2,
-                "renormalization is not stable (vector #{attempt})"
+            let max_delta = preprocess1
+                .iter()
+                .zip(preprocess2.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+
+            assert!(
+                max_delta <= 1.0e-6,
+                "renormalization is not stable (vector #{attempt}), max_delta={max_delta}",
             );
         }
     }

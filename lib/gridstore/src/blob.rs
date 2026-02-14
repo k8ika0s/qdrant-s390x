@@ -43,8 +43,8 @@ impl Blob for Vec<(f64, f64)> {
             .map(|v| {
                 let (a, b) = v.split_at(size_of::<f64>());
                 (
-                    f64::read_from_bytes(a).expect("invalid number of bytes for type f64"),
-                    f64::read_from_bytes(b).expect("invalid number of bytes for type f64"),
+                    f64::from_le_bytes(a.try_into().expect("invalid number of bytes for type f64")),
+                    f64::from_le_bytes(b.try_into().expect("invalid number of bytes for type f64")),
                 )
             })
             .collect()

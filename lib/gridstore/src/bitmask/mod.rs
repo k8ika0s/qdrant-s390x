@@ -503,13 +503,15 @@ impl Bitmask {
         } else {
             leading = raw_region
                 .iter()
-                .take_while_inclusive(|chunk| chunk == &&0)
+                .map(|chunk| chunk.to_le())
+                .take_while_inclusive(|chunk| chunk == &0)
                 .map(|chunk| chunk.trailing_zeros())
                 .sum::<u32>();
             trailing = raw_region
                 .iter()
                 .rev()
-                .take_while_inclusive(|chunk| chunk == &&0)
+                .map(|chunk| chunk.to_le())
+                .take_while_inclusive(|chunk| chunk == &0)
                 .map(|chunk| chunk.leading_zeros())
                 .sum::<u32>();
         }

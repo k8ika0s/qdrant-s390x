@@ -379,8 +379,16 @@ mod tests {
         eprintln!("tokens = {tokens:#?}");
         assert_eq!(tokens.len(), 4);
         assert_eq!(tokens.first(), Some(&Cow::Borrowed("มา")));
-        assert_eq!(tokens.get(1), Some(&Cow::Borrowed("ทางาน")));
-        assert_eq!(tokens.get(2), Some(&Cow::Borrowed("กน")));
+        // Different Unicode normalization backends can keep or drop combining marks.
+        // Accept both spellings as long as token boundaries are preserved.
+        assert!(matches!(
+            tokens.get(1).map(Cow::as_ref),
+            Some("ทางาน") | Some("ท\u{e4d}างาน")
+        ));
+        assert!(matches!(
+            tokens.get(2).map(Cow::as_ref),
+            Some("กน") | Some("ก\u{e31}น")
+        ));
         assert_eq!(tokens.get(3), Some(&Cow::Borrowed("เถอะ")));
     }
 
