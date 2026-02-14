@@ -113,7 +113,8 @@ fn get_system_data() -> RunningEnvironmentTelemetry {
     } else {
         sys_info::os_release().ok()
     };
-    let mut cpu_flags = vec![];
+    #[allow(unused_mut)]
+    let mut cpu_flags: Vec<&str> = vec![];
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         if std::arch::is_x86_feature_detected!("sse") {

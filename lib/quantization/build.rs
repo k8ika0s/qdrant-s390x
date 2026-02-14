@@ -3,22 +3,19 @@ use std::env;
 fn main() {
     println!("cargo:rerun-if-changed=cpp");
     let mut builder = cc::Build::new();
+    let mut has_simd_sources = false;
 
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH")
         .expect("CARGO_CFG_TARGET_ARCH env-var is not defined or is not UTF-8");
 
-    // TODO: Is `CARGO_CFG_TARGET_FEATURE` *always* defined?
-    //
-    // Cargo docs says that "boolean configurations are present if they are set,
-    // and not present otherwise", so, what about "target features"?
-    //
-    // https://doc.rust-lang.org/cargo/reference/environment-variables.html (Ctrl-F CARGO_CFG_<cfg>)
-    let target_feature = env::var("CARGO_CFG_TARGET_FEATURE")
-        .expect("CARGO_CFG_TARGET_FEATURE env-var is not defined or is not UTF-8");
+    // Cargo may omit CARGO_CFG_TARGET_FEATURE for some targets.
+    // Missing value means "no target features enabled".
+    let target_feature = env::var("CARGO_CFG_TARGET_FEATURE").unwrap_or_default();
 
     if target_arch == "x86_64" {
         builder.file("cpp/sse.c");
         builder.file("cpp/avx2.c");
+        has_simd_sources = true;
 
         if builder.get_compiler().is_like_msvc() {
             builder.flag("/arch:AVX");
@@ -36,7 +33,10 @@ fn main() {
     } else if target_arch == "aarch64" && target_feature.split(',').any(|feat| feat == "neon") {
         builder.file("cpp/neon.c");
         builder.flag("-O3");
+        has_simd_sources = true;
     }
 
-    builder.compile("simd_utils");
+    if has_simd_sources {
+        builder.compile("simd_utils");
+    }
 }

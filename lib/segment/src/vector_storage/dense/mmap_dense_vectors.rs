@@ -17,9 +17,9 @@ use parking_lot::Mutex;
 use crate::common::error_logging::LogError;
 use crate::common::operation_error::OperationResult;
 use crate::data_types::primitive::PrimitiveVectorElement;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 use crate::vector_storage::async_io::UringReader;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))))]
 use crate::vector_storage::async_io_mock::UringReader;
 use crate::vector_storage::common::VECTOR_READ_BATCH_SIZE;
 use crate::vector_storage::query_scorer::is_read_with_prefetch_efficient;
@@ -45,7 +45,10 @@ pub struct MmapDenseVectors<T: PrimitiveVectorElement> {
     /// Use [`mmap_seq`] utility function to access this mmap if available.
     _mmap_seq: Option<Arc<Mmap>>,
     /// Context for io_uring-base async IO
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(
+        not(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))),
+        allow(dead_code)
+    )]
     uring_reader: Option<Mutex<UringReader<T>>>,
     /// Memory mapped deletion flags
     deleted: MmapBitSlice,
@@ -235,14 +238,14 @@ impl<T: PrimitiveVectorElement> MmapDenseVectors<T> {
         match &self.uring_reader {
             None => self.process_points_simple(points, callback),
 
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
             Some(uring_reader) => {
                 // Use `UringReader` on Linux
                 let mut uring_guard = uring_reader.lock();
                 uring_guard.read_stream(points, callback)?;
             }
 
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))))]
             Some(_) => {
                 // Fallback to synchronous processing on non-Linux platforms
                 self.process_points_simple(points, callback);

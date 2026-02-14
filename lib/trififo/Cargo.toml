@@ -28,12 +28,14 @@ static_assertions = { version = "1.1.0" }
 # Compare against these caches
 quick_cache = "0.6"
 schnellru = "0.2"
-foyer = "0.22"
 
 # For memory measurement
 cap = "0.1"
 
-# For async runtime (needed by foyer)
+[target.'cfg(not(target_arch = "s390x"))'.dev-dependencies]
+# Foyer currently pulls io-uring, which does not provide prebuilt bindings for s390x.
+# Keep the benchmark comparison available on other architectures.
+foyer = "0.22"
 tokio = { workspace = true }
 
 [[bench]]

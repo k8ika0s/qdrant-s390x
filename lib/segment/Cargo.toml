@@ -128,6 +128,8 @@ roaring = { version = "0.11.3" }
 [target.'cfg(target_os = "linux")'.dependencies]
 cgroups-rs = "0.3"
 procfs = { version = "0.18", default-features = false }
+
+[target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
 io-uring = "0.7.11"
 
 [[bench]]

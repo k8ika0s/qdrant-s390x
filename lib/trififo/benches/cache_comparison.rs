@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use cap::Cap;
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+#[cfg(not(target_arch = "s390x"))]
 use foyer::{EvictionConfig, S3FifoConfig};
 use itertools::Itertools;
 use parking_lot::Mutex;
@@ -224,10 +225,12 @@ impl CacheBench for SchnellruWrapper {
 }
 
 // Foyer in-memory cache wrapper
+#[cfg(not(target_arch = "s390x"))]
 struct FoyerWrapper {
     cache: foyer::Cache<Key, u32>,
 }
 
+#[cfg(not(target_arch = "s390x"))]
 impl FoyerWrapper {
     fn new(capacity: usize) -> Self {
         Self {
@@ -242,6 +245,7 @@ impl FoyerWrapper {
     }
 }
 
+#[cfg(not(target_arch = "s390x"))]
 impl CacheBench for FoyerWrapper {
     fn insert(&self, key: Key, value: u32) {
         self.cache.insert(key, value);
@@ -292,6 +296,7 @@ impl CacheBench for FoyerWrapper {
 enum CacheName {
     QuickCache,
     Schnellru,
+    #[cfg(not(target_arch = "s390x"))]
     Foyer,
     // Trififo,
 }
@@ -301,6 +306,7 @@ impl std::fmt::Display for CacheName {
         match self {
             CacheName::QuickCache => write!(f, "quick_cache"),
             CacheName::Schnellru => write!(f, "schnellru"),
+            #[cfg(not(target_arch = "s390x"))]
             CacheName::Foyer => write!(f, "foyer"),
             // CacheName::Trififo => write!(f, "trififo"),
         }
@@ -311,6 +317,7 @@ fn create_cache(name: CacheName, capacity: usize) -> Arc<dyn CacheBench> {
     match name {
         CacheName::QuickCache => Arc::new(QuickCacheWrapper::new(capacity)),
         CacheName::Schnellru => Arc::new(SchnellruWrapper::new(capacity as u32)),
+        #[cfg(not(target_arch = "s390x"))]
         CacheName::Foyer => Arc::new(FoyerWrapper::new(capacity)),
         // CacheName::Trififo => Arc::new(TrififoWrapper::new(capacity)),
     }
