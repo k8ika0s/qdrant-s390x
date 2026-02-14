@@ -8,27 +8,175 @@ use common::maybe_uninit::maybe_uninit_fill_from;
 use fs_err as fs;
 use fs_err::File;
 use io::file_operations::atomic_save_json;
-use memmap2::MmapMut;
-use memory::chunked_utils::{UniversalMmapChunk, chunk_name, create_chunk, read_mmaps};
+use memory::chunked_utils::{chunk_name, create_chunk, read_mmaps, UniversalMmapChunk};
 use memory::fadvise::clear_disk_cache;
 use memory::madvise::{Advice, AdviceSetting};
 use memory::mmap_ops::{create_and_ensure_length, open_write_mmap};
-use memory::mmap_type::MmapType;
+use memory::mmap_type::{MmapFlusher, MmapType};
 use num_traits::AsPrimitive;
 use serde::{Deserialize, Serialize};
 
-use crate::common::Flusher;
 use crate::common::operation_error::{OperationError, OperationResult};
+use crate::common::Flusher;
 use crate::vector_storage::common::{CHUNK_SIZE, PAGE_SIZE_BYTES, VECTOR_READ_BATCH_SIZE};
 use crate::vector_storage::query_scorer::is_read_with_prefetch_efficient;
 use crate::vector_storage::{AccessPattern, VectorOffset, VectorOffsetType};
 
 const CONFIG_FILE_NAME: &str = "config.json";
 const STATUS_FILE_NAME: &str = "status.dat";
+const STATUS_MAGIC: [u8; 4] = *b"cmv1";
+const STATUS_VERSION: u32 = 1;
+const STATUS_FILE_SIZE: usize = 16;
+const STATUS_MAGIC_END: usize = 4;
+const STATUS_VERSION_OFFSET: usize = STATUS_MAGIC_END;
+const STATUS_LEN_OFFSET: usize = STATUS_VERSION_OFFSET + 4;
+const LEGACY_STATUS_FILE_SIZE: usize = std::mem::size_of::<usize>();
 
-#[repr(C)]
-pub struct Status {
-    pub len: usize,
+#[derive(Debug)]
+struct StatusFile {
+    mmap: MmapType<[u8; STATUS_FILE_SIZE]>,
+    len: usize,
+}
+
+impl StatusFile {
+    fn open(directory: &Path, max_vectors: usize) -> OperationResult<Self> {
+        let status_file = ChunkedMmapVectors::<u8>::status_file(directory);
+        if !status_file.exists() {
+            create_and_ensure_length(&status_file, STATUS_FILE_SIZE)?;
+            let mmap = open_write_mmap(
+                &status_file,
+                AdviceSetting::from(Advice::Normal),
+                false, // Status file is write-only
+            )?;
+            let mut mmap = unsafe { MmapType::try_from(mmap)? };
+            initialize_status_bytes(&mut mmap, 0)?;
+            return Ok(Self { mmap, len: 0 });
+        }
+
+        let file_len = fs::metadata(&status_file)?.len() as usize;
+        if file_len == STATUS_FILE_SIZE {
+            let mmap = open_write_mmap(
+                &status_file,
+                AdviceSetting::from(Advice::Normal),
+                false, // Status file is write-only
+            )?;
+            let mmap = unsafe { MmapType::try_from(mmap)? };
+            let len = parse_status_len(&mmap)?;
+            if len > max_vectors {
+                return Err(OperationError::service_error(format!(
+                    "Invalid chunked mmap status len {len}, max vectors is {max_vectors}",
+                )));
+            }
+            return Ok(Self { mmap, len });
+        }
+
+        if file_len == LEGACY_STATUS_FILE_SIZE {
+            let legacy_raw = fs::read(&status_file)?;
+            let len = decode_legacy_status_len(&legacy_raw, max_vectors)?;
+            create_and_ensure_length(&status_file, STATUS_FILE_SIZE)?;
+            let mmap = open_write_mmap(
+                &status_file,
+                AdviceSetting::from(Advice::Normal),
+                false, // Status file is write-only
+            )?;
+            let mut mmap = unsafe { MmapType::try_from(mmap)? };
+            initialize_status_bytes(&mut mmap, len)?;
+            return Ok(Self { mmap, len });
+        }
+
+        Err(OperationError::service_error(format!(
+            "Unexpected chunked mmap status size {}, expected {} or {}",
+            file_len, STATUS_FILE_SIZE, LEGACY_STATUS_FILE_SIZE
+        )))
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    fn set_len(&mut self, len: usize) -> OperationResult<()> {
+        write_status_len(&mut self.mmap, len)?;
+        self.len = len;
+        Ok(())
+    }
+
+    #[inline]
+    fn flusher(&self) -> MmapFlusher {
+        self.mmap.flusher()
+    }
+}
+
+fn initialize_status_bytes(status: &mut [u8; STATUS_FILE_SIZE], len: usize) -> OperationResult<()> {
+    status[..STATUS_MAGIC_END].copy_from_slice(&STATUS_MAGIC);
+    status[STATUS_VERSION_OFFSET..STATUS_LEN_OFFSET].copy_from_slice(&STATUS_VERSION.to_le_bytes());
+    write_status_len(status, len)
+}
+
+fn write_status_len(status: &mut [u8; STATUS_FILE_SIZE], len: usize) -> OperationResult<()> {
+    let len = u64::try_from(len).map_err(|_| {
+        OperationError::service_error(format!(
+            "Chunked mmap status len {len} does not fit into u64",
+        ))
+    })?;
+    status[STATUS_LEN_OFFSET..STATUS_FILE_SIZE].copy_from_slice(&len.to_le_bytes());
+    Ok(())
+}
+
+fn parse_status_len(status: &[u8; STATUS_FILE_SIZE]) -> OperationResult<usize> {
+    if status[..STATUS_MAGIC_END] != STATUS_MAGIC {
+        return Err(OperationError::service_error(
+            "Invalid chunked mmap status magic".to_string(),
+        ));
+    }
+
+    let mut version_raw = [0u8; 4];
+    version_raw.copy_from_slice(&status[STATUS_VERSION_OFFSET..STATUS_LEN_OFFSET]);
+    let version = u32::from_le_bytes(version_raw);
+    if version != STATUS_VERSION {
+        return Err(OperationError::service_error(format!(
+            "Unsupported chunked mmap status version {version}",
+        )));
+    }
+
+    let mut len_raw = [0u8; 8];
+    len_raw.copy_from_slice(&status[STATUS_LEN_OFFSET..STATUS_FILE_SIZE]);
+    let len = u64::from_le_bytes(len_raw);
+    usize::try_from(len).map_err(|_| {
+        OperationError::service_error(format!(
+            "Chunked mmap status len {len} does not fit into usize",
+        ))
+    })
+}
+
+fn decode_legacy_status_len(legacy_raw: &[u8], max_vectors: usize) -> OperationResult<usize> {
+    if legacy_raw.len() != LEGACY_STATUS_FILE_SIZE {
+        return Err(OperationError::service_error(format!(
+            "Invalid legacy chunked mmap status size {}, expected {}",
+            legacy_raw.len(),
+            LEGACY_STATUS_FILE_SIZE
+        )));
+    }
+
+    let mut raw = [0u8; LEGACY_STATUS_FILE_SIZE];
+    raw.copy_from_slice(legacy_raw);
+
+    // Legacy status had native `usize` persistence. Prefer canonical LE decode to support
+    // migration of existing LE segments onto BE hosts.
+    let le_len = usize::from_le_bytes(raw);
+    if le_len <= max_vectors {
+        return Ok(le_len);
+    }
+
+    let native_len = usize::from_ne_bytes(raw);
+    if native_len <= max_vectors {
+        return Ok(native_len);
+    }
+
+    Err(OperationError::service_error(format!(
+        "Invalid legacy chunked mmap status len (le={le_len}, native={native_len}, max={max_vectors})",
+    )))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -43,7 +191,7 @@ struct ChunkedMmapConfig {
 #[derive(Debug)]
 pub struct ChunkedMmapVectors<T: Sized + 'static> {
     config: ChunkedMmapConfig,
-    status: MmapType<Status>,
+    status: StatusFile,
     chunks: Vec<UniversalMmapChunk<T>>,
     directory: PathBuf,
 }
@@ -55,21 +203,6 @@ impl<T: Sized + Copy + 'static> ChunkedMmapVectors<T> {
 
     pub fn status_file(directory: &Path) -> PathBuf {
         directory.join(STATUS_FILE_NAME)
-    }
-
-    pub fn ensure_status_file(directory: &Path) -> OperationResult<MmapMut> {
-        let status_file = Self::status_file(directory);
-        if !status_file.exists() {
-            {
-                let length = std::mem::size_of::<usize>() as u64;
-                create_and_ensure_length(&status_file, length as usize)?;
-            }
-        }
-        Ok(open_write_mmap(
-            &status_file,
-            AdviceSetting::from(Advice::Normal),
-            false, // Status file is write-only
-        )?)
     }
 
     fn ensure_config(
@@ -135,11 +268,17 @@ impl<T: Sized + Copy + 'static> ChunkedMmapVectors<T> {
         populate: Option<bool>,
     ) -> OperationResult<Self> {
         fs::create_dir_all(directory)?;
-        let status_mmap = Self::ensure_status_file(directory)?;
-        let status = unsafe { MmapType::from(status_mmap) };
-
         let config = Self::ensure_config(directory, dim, populate)?;
         let chunks = read_mmaps(directory, populate.unwrap_or_default(), advice)?;
+        let max_vectors = config
+            .chunk_size_vectors
+            .checked_mul(chunks.len())
+            .ok_or_else(|| {
+                OperationError::service_error(
+                    "Chunked mmap vectors capacity overflow when opening status".to_string(),
+                )
+            })?;
+        let status = StatusFile::open(directory, max_vectors)?;
         let vectors = Self {
             status,
             config,
@@ -168,7 +307,7 @@ impl<T: Sized + Copy + 'static> ChunkedMmapVectors<T> {
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.status.len
+        self.status.len()
     }
 
     #[inline]
@@ -234,10 +373,10 @@ impl<T: Sized + Copy + 'static> ChunkedMmapVectors<T> {
             .vector_io_write_counter()
             .incr_delta(size_of_val(vectors));
 
-        let new_len = max(self.status.len, start_key + count);
+        let new_len = max(self.status.len(), start_key + count);
 
-        if new_len > self.status.len {
-            self.status.len = new_len;
+        if new_len > self.status.len() {
+            self.status.set_len(new_len)?;
         }
         Ok(())
     }
@@ -254,7 +393,7 @@ impl<T: Sized + Copy + 'static> ChunkedMmapVectors<T> {
         vector: &[T],
         hw_counter: &HardwareCounterCell,
     ) -> OperationResult<VectorOffsetType> {
-        let new_id = self.status.len;
+        let new_id = self.status.len();
         self.insert(new_id, vector, hw_counter)?;
         Ok(new_id)
     }
@@ -370,8 +509,9 @@ impl<T: Sized + Copy + 'static> ChunkedMmapVectors<T> {
 mod tests {
     use std::iter::zip;
 
-    use rand::SeedableRng;
+    use fs_err as fs;
     use rand::prelude::StdRng;
+    use rand::SeedableRng;
     use tempfile::Builder;
 
     use super::*;
@@ -443,5 +583,75 @@ mod tests {
 
             chunked_mmap.flusher()().unwrap();
         }
+    }
+
+    #[test]
+    fn test_chunked_mmap_migrates_legacy_status_file() {
+        let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
+        let dim = 32;
+        let vector_count = 17;
+        let hw_counter = HardwareCounterCell::new();
+
+        {
+            let mut storage: ChunkedMmapVectors<VectorElementType> =
+                ChunkedMmapVectors::open(dir.path(), dim, AdviceSetting::Global, Some(true))
+                    .unwrap();
+            for i in 0..vector_count {
+                let vector = vec![i as VectorElementType; dim];
+                storage.push(&vector, &hw_counter).unwrap();
+            }
+            storage.flusher()().unwrap();
+        }
+
+        let status_path = ChunkedMmapVectors::<VectorElementType>::status_file(dir.path());
+        fs::write(status_path.clone(), (vector_count as usize).to_le_bytes()).unwrap();
+        assert_eq!(
+            fs::metadata(status_path.clone()).unwrap().len() as usize,
+            LEGACY_STATUS_FILE_SIZE
+        );
+
+        let reopened: ChunkedMmapVectors<VectorElementType> =
+            ChunkedMmapVectors::open(dir.path(), dim, AdviceSetting::Global, Some(true)).unwrap();
+        assert_eq!(reopened.len(), vector_count as usize);
+
+        let raw_status = fs::read(status_path).unwrap();
+        assert_eq!(raw_status.len(), STATUS_FILE_SIZE);
+        assert_eq!(&raw_status[..STATUS_MAGIC_END], &STATUS_MAGIC);
+        let mut version_raw = [0u8; 4];
+        version_raw.copy_from_slice(&raw_status[STATUS_VERSION_OFFSET..STATUS_LEN_OFFSET]);
+        assert_eq!(u32::from_le_bytes(version_raw), STATUS_VERSION);
+        let mut len_raw = [0u8; 8];
+        len_raw.copy_from_slice(&raw_status[STATUS_LEN_OFFSET..STATUS_FILE_SIZE]);
+        assert_eq!(u64::from_le_bytes(len_raw), vector_count as u64);
+    }
+
+    #[test]
+    fn test_chunked_mmap_rejects_status_len_beyond_chunk_capacity() {
+        let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
+        let dim = 32;
+        let hw_counter = HardwareCounterCell::new();
+
+        {
+            let mut storage: ChunkedMmapVectors<VectorElementType> =
+                ChunkedMmapVectors::open(dir.path(), dim, AdviceSetting::Global, Some(true))
+                    .unwrap();
+            storage.push(&vec![0.0; dim], &hw_counter).unwrap();
+            storage.flusher()().unwrap();
+        }
+
+        let max_vectors = CHUNK_SIZE / (dim * std::mem::size_of::<VectorElementType>());
+        let mut status = [0u8; STATUS_FILE_SIZE];
+        initialize_status_bytes(&mut status, max_vectors + 1).unwrap();
+        let status_path = ChunkedMmapVectors::<VectorElementType>::status_file(dir.path());
+        fs::write(status_path, status).unwrap();
+
+        let err = ChunkedMmapVectors::<VectorElementType>::open(
+            dir.path(),
+            dim,
+            AdviceSetting::Global,
+            Some(true),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Invalid chunked mmap status len"));
     }
 }

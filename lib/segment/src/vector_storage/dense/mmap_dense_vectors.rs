@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::mem::{self, MaybeUninit, size_of, transmute};
+use std::mem::{MaybeUninit, size_of, transmute};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -17,9 +17,15 @@ use parking_lot::Mutex;
 use crate::common::error_logging::LogError;
 use crate::common::operation_error::OperationResult;
 use crate::data_types::primitive::PrimitiveVectorElement;
-#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 use crate::vector_storage::async_io::UringReader;
-#[cfg(not(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
 use crate::vector_storage::async_io_mock::UringReader;
 use crate::vector_storage::common::VECTOR_READ_BATCH_SIZE;
 use crate::vector_storage::query_scorer::is_read_with_prefetch_efficient;
@@ -28,6 +34,7 @@ use crate::vector_storage::{AccessPattern, Random, Sequential};
 const HEADER_SIZE: usize = 4;
 const VECTORS_HEADER: &[u8; HEADER_SIZE] = b"data";
 const DELETED_HEADER: &[u8; HEADER_SIZE] = b"drop";
+const DELETED_LAYOUT_BLOCK_BYTES: usize = size_of::<u64>();
 
 /// Mem-mapped file for dense vectors
 #[derive(Debug)]
@@ -46,7 +53,10 @@ pub struct MmapDenseVectors<T: PrimitiveVectorElement> {
     _mmap_seq: Option<Arc<Mmap>>,
     /// Context for io_uring-base async IO
     #[cfg_attr(
-        not(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))),
+        not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )),
         allow(dead_code)
     )]
     uring_reader: Option<Mutex<UringReader<T>>>,
@@ -238,14 +248,20 @@ impl<T: PrimitiveVectorElement> MmapDenseVectors<T> {
         match &self.uring_reader {
             None => self.process_points_simple(points, callback),
 
-            #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+            #[cfg(all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
             Some(uring_reader) => {
                 // Use `UringReader` on Linux
                 let mut uring_guard = uring_reader.lock();
                 uring_guard.read_stream(points, callback)?;
             }
 
-            #[cfg(not(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+            #[cfg(not(all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )))]
             Some(_) => {
                 // Fallback to synchronous processing on non-Linux platforms
                 self.process_points_simple(points, callback);
@@ -292,17 +308,28 @@ fn ensure_mmap_file_size(path: &Path, header: &[u8], size: Option<u64>) -> Opera
 /// Get start position of flags `BitSlice` in deleted mmap.
 #[inline]
 const fn deleted_mmap_data_start() -> usize {
-    let align = mem::align_of::<usize>();
-    HEADER_SIZE.div_ceil(align) * align
+    HEADER_SIZE.div_ceil(DELETED_LAYOUT_BLOCK_BYTES) * DELETED_LAYOUT_BLOCK_BYTES
 }
 
 /// Calculate size for deleted mmap to hold the given number of vectors.
 ///
 /// The mmap will hold a file header and an aligned `BitSlice`.
 fn deleted_mmap_size(num: usize) -> usize {
-    let unit_size = mem::size_of::<usize>();
     let num_bytes = num.div_ceil(8);
-    let num_usizes = num_bytes.div_ceil(unit_size);
-    let data_size = num_usizes * unit_size;
+    let data_size = num_bytes.next_multiple_of(DELETED_LAYOUT_BLOCK_BYTES);
     deleted_mmap_data_start() + data_size
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_deleted_mmap_layout_is_fixed_width() {
+        assert_eq!(deleted_mmap_data_start(), 8);
+        assert_eq!(deleted_mmap_size(0), 8);
+        assert_eq!(deleted_mmap_size(1), 16);
+        assert_eq!(deleted_mmap_size(64), 16);
+        assert_eq!(deleted_mmap_size(65), 24);
+    }
 }
