@@ -289,11 +289,25 @@ impl GraphLinksView<'_> {
             .map_err(|e| {
                 OperationError::service_error(format!("Can't create decompressor: {e}"))
             })?;
+        let full_offsets_validation = match header.version.get() {
+            // Canonical format: offsets are written little-endian; validate fully in debug/tests.
+            // In release builds, prefer constant-time checks to avoid O(n) startup cost on large
+            // indices.
+            HEADER_VERSION_COMPRESSED => cfg!(debug_assertions),
+            // Legacy format: offsets may come from older writers; keep full validation.
+            HEADER_VERSION_COMPRESSED_LEGACY => true,
+            version => {
+                return Err(OperationError::service_error(format!(
+                    "Unsupported compressed GraphLinks version: {version:#x}"
+                )));
+            }
+        };
         validate_compressed_offsets_reader(
             &offsets,
             total_offset_count,
             header.total_neighbors_bytes.get(),
             "compressed",
+            full_offsets_validation,
         )?;
 
         Ok(GraphLinksView {
@@ -345,11 +359,21 @@ impl GraphLinksView<'_> {
             .map_err(|e| {
                 OperationError::service_error(format!("Can't create decompressor: {e}"))
             })?;
+        let full_offsets_validation = match header.version.get() {
+            HEADER_VERSION_COMPRESSED_WITH_VECTORS => cfg!(debug_assertions),
+            HEADER_VERSION_COMPRESSED_WITH_VECTORS_LEGACY => true,
+            version => {
+                return Err(OperationError::service_error(format!(
+                    "Unsupported compressed-with-vectors GraphLinks version: {version:#x}"
+                )));
+            }
+        };
         validate_compressed_offsets_reader(
             &offsets,
             total_offset_count,
             header.total_neighbors_bytes.get(),
             "compressed-with-vectors",
+            full_offsets_validation,
         )?;
 
         Ok(GraphLinksView {
@@ -846,6 +870,7 @@ fn validate_compressed_offsets_reader(
     total_offset_count: u64,
     total_neighbors_bytes: u64,
     kind: &str,
+    full_scan: bool,
 ) -> OperationResult<()> {
     let total_offset_count =
         usize::try_from(total_offset_count).map_err(|_| error_unsufficent_size())?;
@@ -862,6 +887,40 @@ fn validate_compressed_offsets_reader(
         )));
     }
 
+    // Cheap invariants that we always want to enforce.
+    let last = offsets
+        .get(total_offset_count - 1)
+        .ok_or_else(error_unsufficent_size)?;
+    if last != total_neighbors_bytes {
+        return Err(OperationError::service_error(format!(
+            "Invalid {kind} GraphLinks offsets: last offset mismatch"
+        )));
+    }
+
+    // In release builds on canonical formats, avoid scanning the full offsets array (can be
+    // millions of values). Debug/test builds and legacy formats keep the full validation.
+    if !full_scan {
+        // Spot-check a small prefix to catch obvious corruption without O(n) cost.
+        let prefix_len = total_offset_count.min(1024);
+        let mut previous = first;
+        for idx in 1..prefix_len {
+            let current = offsets.get(idx).ok_or_else(error_unsufficent_size)?;
+            if current < previous {
+                return Err(OperationError::service_error(format!(
+                    "Invalid {kind} GraphLinks offsets: must be non-decreasing"
+                )));
+            }
+            if current > total_neighbors_bytes {
+                return Err(OperationError::service_error(format!(
+                    "Invalid {kind} GraphLinks offsets: out of bounds"
+                )));
+            }
+            previous = current;
+        }
+
+        return Ok(());
+    }
+
     let mut previous = first;
     for idx in 1..total_offset_count {
         let current = offsets.get(idx).ok_or_else(error_unsufficent_size)?;
@@ -876,12 +935,6 @@ fn validate_compressed_offsets_reader(
             )));
         }
         previous = current;
-    }
-
-    if previous != total_neighbors_bytes {
-        return Err(OperationError::service_error(format!(
-            "Invalid {kind} GraphLinks offsets: last offset mismatch"
-        )));
     }
 
     Ok(())
