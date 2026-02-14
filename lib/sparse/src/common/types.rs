@@ -106,12 +106,36 @@ impl From<QuantizedU8> for DimWeight {
     }
 }
 
+impl QuantizedU8 {
+    #[inline]
+    pub(crate) fn from_raw(raw: u8) -> Self {
+        Self(raw)
+    }
+
+    #[inline]
+    pub(crate) fn raw(self) -> u8 {
+        self.0
+    }
+}
+
 #[derive(PartialEq, Default, Copy, Clone, Debug)]
 pub struct QuantizedU8Params {
     /// Minimum value in the range
     min: f32,
     /// Difference divided by 256, aka `(max - min) / 255`
     diff256: f32,
+}
+
+impl QuantizedU8Params {
+    #[inline]
+    pub(crate) fn from_parts(min: f32, diff256: f32) -> Self {
+        Self { min, diff256 }
+    }
+
+    #[inline]
+    pub(crate) fn parts(self) -> (f32, f32) {
+        (self.min, self.diff256)
+    }
 }
 
 impl Weight for QuantizedU8 {

@@ -1,10 +1,12 @@
+use std::any::TypeId;
 use std::borrow::Cow;
-use std::io::{BufWriter, Write as _};
+use std::io::{BufWriter, Write};
 use std::marker::PhantomData;
-use std::mem::size_of;
+use std::mem::{offset_of, size_of};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use bitpacking::BitPacker as _;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use io::file_operations::{atomic_save_json, read_json};
@@ -22,9 +24,10 @@ use serde::{Deserialize, Serialize};
 use super::INDEX_FILE_NAME;
 use super::inverted_index_compressed_immutable_ram::InvertedIndexCompressedImmutableRam;
 use crate::common::sparse_vector::RemappedSparseVector;
-use crate::common::types::{DimId, DimOffset, Weight};
+use crate::common::types::{DimId, DimOffset, QuantizedU8, QuantizedU8Params, Weight};
 use crate::index::compressed_posting_list::{
-    CompressedPostingChunk, CompressedPostingListIterator, CompressedPostingListView,
+    CompressedPostingChunk, CompressedPostingList, CompressedPostingListIterator,
+    CompressedPostingListView,
 };
 use crate::index::inverted_index::InvertedIndex;
 use crate::index::inverted_index::inverted_index_ram::InvertedIndexRam;
@@ -55,9 +58,10 @@ pub struct InvertedIndexFileHeader {
 
 /// Inverted flatten index from dimension id to posting list
 #[derive(Debug)]
-pub struct InvertedIndexCompressedMmap<W> {
+pub struct InvertedIndexCompressedMmap<W: Weight> {
     path: PathBuf,
     mmap: Arc<Mmap>,
+    decoded_postings: Option<Vec<CompressedPostingList<W>>>,
     pub file_header: InvertedIndexFileHeader,
     _phantom: PhantomData<W>,
 }
@@ -73,6 +77,15 @@ struct PostingListFileHeader<W: Weight> {
     pub ids_len: u32,
     pub chunks_count: u32,
     pub quantization_params: W::QuantizationParams,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PostingListFileHeaderDecoded<W: Weight> {
+    ids_start: u64,
+    last_id: u32,
+    ids_len: u32,
+    chunks_count: u32,
+    quantization_params: W::QuantizationParams,
 }
 
 impl<W: Weight> InvertedIndex for InvertedIndexCompressedMmap<W> {
@@ -193,6 +206,13 @@ impl<W: Weight> InvertedIndexCompressedMmap<W> {
             return None;
         }
 
+        if let Some(decoded_postings) = &self.decoded_postings {
+            hw_counter.vector_io_read().incr_delta(Self::HEADER_SIZE);
+            return decoded_postings
+                .get(id as usize)
+                .map(|posting| posting.view(hw_counter));
+        }
+
         // TODO Safety.
         let header: PostingListFileHeader<W> = unsafe {
             self.slice_part::<PostingListFileHeader<W>>(
@@ -262,6 +282,488 @@ impl<W: Weight> InvertedIndexCompressedMmap<W> {
         }
     }
 
+    fn invalid_data(message: impl Into<String>) -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, message.into())
+    }
+
+    fn weight_size() -> Option<usize> {
+        if TypeId::of::<W>() == TypeId::of::<f32>() {
+            Some(size_of::<f32>())
+        } else if TypeId::of::<W>() == TypeId::of::<half::f16>() {
+            Some(size_of::<u16>())
+        } else if TypeId::of::<W>() == TypeId::of::<u8>() {
+            Some(size_of::<u8>())
+        } else if TypeId::of::<W>() == TypeId::of::<QuantizedU8>() {
+            Some(size_of::<u8>())
+        } else {
+            None
+        }
+    }
+
+    fn quantization_params_size() -> Option<usize> {
+        if TypeId::of::<W>() == TypeId::of::<f32>()
+            || TypeId::of::<W>() == TypeId::of::<half::f16>()
+            || TypeId::of::<W>() == TypeId::of::<u8>()
+        {
+            Some(0)
+        } else if TypeId::of::<W>() == TypeId::of::<QuantizedU8>() {
+            Some(size_of::<QuantizedU8Params>())
+        } else {
+            None
+        }
+    }
+
+    fn decode_weight_le(bytes: &[u8]) -> std::io::Result<W> {
+        if TypeId::of::<W>() == TypeId::of::<f32>() {
+            if bytes.len() != size_of::<f32>() {
+                return Err(Self::invalid_data("invalid f32 sparse weight size"));
+            }
+            let value = f32::from_le_bytes(bytes.try_into().expect("slice size checked"));
+            return Ok(unsafe { std::mem::transmute_copy::<f32, W>(&value) });
+        }
+        if TypeId::of::<W>() == TypeId::of::<half::f16>() {
+            if bytes.len() != size_of::<u16>() {
+                return Err(Self::invalid_data("invalid f16 sparse weight size"));
+            }
+            let bits = u16::from_le_bytes(bytes.try_into().expect("slice size checked"));
+            let value = half::f16::from_bits(bits);
+            return Ok(unsafe { std::mem::transmute_copy::<half::f16, W>(&value) });
+        }
+        if TypeId::of::<W>() == TypeId::of::<u8>() {
+            if bytes.len() != size_of::<u8>() {
+                return Err(Self::invalid_data("invalid u8 sparse weight size"));
+            }
+            let value = bytes[0];
+            return Ok(unsafe { std::mem::transmute_copy::<u8, W>(&value) });
+        }
+        if TypeId::of::<W>() == TypeId::of::<QuantizedU8>() {
+            if bytes.len() != size_of::<u8>() {
+                return Err(Self::invalid_data("invalid QuantizedU8 sparse weight size"));
+            }
+            let value = QuantizedU8::from_raw(bytes[0]);
+            return Ok(unsafe { std::mem::transmute_copy::<QuantizedU8, W>(&value) });
+        }
+
+        Err(Self::invalid_data(format!(
+            "unsupported sparse weight type {} for mmap endianness conversion",
+            std::any::type_name::<W>()
+        )))
+    }
+
+    fn encode_weight_le(value: W, out: &mut [u8]) -> std::io::Result<()> {
+        if TypeId::of::<W>() == TypeId::of::<f32>() {
+            if out.len() != size_of::<f32>() {
+                return Err(Self::invalid_data("invalid f32 sparse weight output size"));
+            }
+            let value = unsafe { std::mem::transmute_copy::<W, f32>(&value) };
+            out.copy_from_slice(&value.to_le_bytes());
+            return Ok(());
+        }
+        if TypeId::of::<W>() == TypeId::of::<half::f16>() {
+            if out.len() != size_of::<u16>() {
+                return Err(Self::invalid_data("invalid f16 sparse weight output size"));
+            }
+            let value = unsafe { std::mem::transmute_copy::<W, half::f16>(&value) };
+            out.copy_from_slice(&value.to_bits().to_le_bytes());
+            return Ok(());
+        }
+        if TypeId::of::<W>() == TypeId::of::<u8>() {
+            if out.len() != size_of::<u8>() {
+                return Err(Self::invalid_data("invalid u8 sparse weight output size"));
+            }
+            let value = unsafe { std::mem::transmute_copy::<W, u8>(&value) };
+            out[0] = value;
+            return Ok(());
+        }
+        if TypeId::of::<W>() == TypeId::of::<QuantizedU8>() {
+            if out.len() != size_of::<u8>() {
+                return Err(Self::invalid_data(
+                    "invalid QuantizedU8 sparse weight output size",
+                ));
+            }
+            let value = unsafe { std::mem::transmute_copy::<W, QuantizedU8>(&value) };
+            out[0] = value.raw();
+            return Ok(());
+        }
+
+        Err(Self::invalid_data(format!(
+            "unsupported sparse weight type {} for mmap endianness conversion",
+            std::any::type_name::<W>()
+        )))
+    }
+
+    fn decode_quantization_params_le(bytes: &[u8]) -> std::io::Result<W::QuantizationParams> {
+        if TypeId::of::<W>() == TypeId::of::<f32>()
+            || TypeId::of::<W>() == TypeId::of::<half::f16>()
+            || TypeId::of::<W>() == TypeId::of::<u8>()
+        {
+            if !bytes.is_empty() {
+                return Err(Self::invalid_data(
+                    "unit quantization params must be empty for sparse mmap header",
+                ));
+            }
+            let unit = ();
+            return Ok(unsafe { std::mem::transmute_copy::<(), W::QuantizationParams>(&unit) });
+        }
+
+        if TypeId::of::<W>() == TypeId::of::<QuantizedU8>() {
+            if bytes.len() != size_of::<QuantizedU8Params>() {
+                return Err(Self::invalid_data("invalid QuantizedU8 params size"));
+            }
+            let min = f32::from_le_bytes(bytes[0..4].try_into().expect("slice size checked"));
+            let diff256 = f32::from_le_bytes(bytes[4..8].try_into().expect("slice size checked"));
+            let params = QuantizedU8Params::from_parts(min, diff256);
+            return Ok(unsafe {
+                std::mem::transmute_copy::<QuantizedU8Params, W::QuantizationParams>(&params)
+            });
+        }
+
+        Err(Self::invalid_data(format!(
+            "unsupported sparse quantization params type for {}",
+            std::any::type_name::<W>()
+        )))
+    }
+
+    fn encode_quantization_params_le(
+        params: W::QuantizationParams,
+        out: &mut [u8],
+    ) -> std::io::Result<()> {
+        if TypeId::of::<W>() == TypeId::of::<f32>()
+            || TypeId::of::<W>() == TypeId::of::<half::f16>()
+            || TypeId::of::<W>() == TypeId::of::<u8>()
+        {
+            if !out.is_empty() {
+                return Err(Self::invalid_data(
+                    "unit quantization params output must be empty",
+                ));
+            }
+            return Ok(());
+        }
+
+        if TypeId::of::<W>() == TypeId::of::<QuantizedU8>() {
+            if out.len() != size_of::<QuantizedU8Params>() {
+                return Err(Self::invalid_data("invalid QuantizedU8 params output size"));
+            }
+            let params = unsafe {
+                std::mem::transmute_copy::<W::QuantizationParams, QuantizedU8Params>(&params)
+            };
+            let (min, diff256) = params.parts();
+            out[0..4].copy_from_slice(&min.to_le_bytes());
+            out[4..8].copy_from_slice(&diff256.to_le_bytes());
+            return Ok(());
+        }
+
+        Err(Self::invalid_data(format!(
+            "unsupported sparse quantization params type for {}",
+            std::any::type_name::<W>()
+        )))
+    }
+
+    fn encode_posting_header_le(
+        header: &PostingListFileHeaderDecoded<W>,
+        out: &mut [u8],
+    ) -> std::io::Result<()> {
+        const IDS_START_OFFSET: usize = 0;
+        const LAST_ID_OFFSET: usize = 8;
+        const IDS_LEN_OFFSET: usize = 12;
+        const CHUNKS_COUNT_OFFSET: usize = 16;
+        const QPARAMS_OFFSET: usize = 20;
+
+        if out.len() != Self::HEADER_SIZE {
+            return Err(Self::invalid_data(
+                "invalid sparse posting header output size",
+            ));
+        }
+
+        let params_size = Self::quantization_params_size().ok_or_else(|| {
+            Self::invalid_data(format!(
+                "unsupported sparse quantization params for {}",
+                std::any::type_name::<W>()
+            ))
+        })?;
+
+        if QPARAMS_OFFSET + params_size > out.len() {
+            return Err(Self::invalid_data("invalid sparse posting header layout"));
+        }
+
+        out.fill(0);
+        out[IDS_START_OFFSET..IDS_START_OFFSET + size_of::<u64>()]
+            .copy_from_slice(&header.ids_start.to_le_bytes());
+        out[LAST_ID_OFFSET..LAST_ID_OFFSET + size_of::<u32>()]
+            .copy_from_slice(&header.last_id.to_le_bytes());
+        out[IDS_LEN_OFFSET..IDS_LEN_OFFSET + size_of::<u32>()]
+            .copy_from_slice(&header.ids_len.to_le_bytes());
+        out[CHUNKS_COUNT_OFFSET..CHUNKS_COUNT_OFFSET + size_of::<u32>()]
+            .copy_from_slice(&header.chunks_count.to_le_bytes());
+        Self::encode_quantization_params_le(
+            header.quantization_params,
+            &mut out[QPARAMS_OFFSET..QPARAMS_OFFSET + params_size],
+        )?;
+
+        Ok(())
+    }
+
+    fn decode_posting_header_le(data: &[u8]) -> std::io::Result<PostingListFileHeaderDecoded<W>> {
+        const IDS_START_OFFSET: usize = 0;
+        const LAST_ID_OFFSET: usize = 8;
+        const IDS_LEN_OFFSET: usize = 12;
+        const CHUNKS_COUNT_OFFSET: usize = 16;
+        const QPARAMS_OFFSET: usize = 20;
+
+        if data.len() != Self::HEADER_SIZE {
+            return Err(Self::invalid_data("invalid sparse posting header size"));
+        }
+
+        let params_size = Self::quantization_params_size().ok_or_else(|| {
+            Self::invalid_data(format!(
+                "unsupported sparse quantization params for {}",
+                std::any::type_name::<W>()
+            ))
+        })?;
+
+        if QPARAMS_OFFSET + params_size > data.len() {
+            return Err(Self::invalid_data("invalid sparse posting header layout"));
+        }
+
+        let ids_start = u64::from_le_bytes(
+            data[IDS_START_OFFSET..IDS_START_OFFSET + size_of::<u64>()]
+                .try_into()
+                .expect("slice size checked"),
+        );
+        let last_id = u32::from_le_bytes(
+            data[LAST_ID_OFFSET..LAST_ID_OFFSET + size_of::<u32>()]
+                .try_into()
+                .expect("slice size checked"),
+        );
+        let ids_len = u32::from_le_bytes(
+            data[IDS_LEN_OFFSET..IDS_LEN_OFFSET + size_of::<u32>()]
+                .try_into()
+                .expect("slice size checked"),
+        );
+        let chunks_count = u32::from_le_bytes(
+            data[CHUNKS_COUNT_OFFSET..CHUNKS_COUNT_OFFSET + size_of::<u32>()]
+                .try_into()
+                .expect("slice size checked"),
+        );
+
+        let quantization_params = Self::decode_quantization_params_le(
+            &data[QPARAMS_OFFSET..QPARAMS_OFFSET + params_size],
+        )?;
+
+        Ok(PostingListFileHeaderDecoded {
+            ids_start,
+            last_id,
+            ids_len,
+            chunks_count,
+            quantization_params,
+        })
+    }
+
+    fn decode_chunks_le(
+        bytes: &[u8],
+        count: usize,
+    ) -> std::io::Result<Vec<CompressedPostingChunk<W>>> {
+        let chunk_size = size_of::<CompressedPostingChunk<W>>();
+        let expected_len = count
+            .checked_mul(chunk_size)
+            .ok_or_else(|| Self::invalid_data("sparse chunks size overflow"))?;
+        if bytes.len() != expected_len {
+            return Err(Self::invalid_data("invalid sparse chunks byte size"));
+        }
+
+        let weight_size = Self::weight_size().ok_or_else(|| {
+            Self::invalid_data(format!(
+                "unsupported sparse weight type {}",
+                std::any::type_name::<W>()
+            ))
+        })?;
+        const WEIGHTS_OFFSET: usize = size_of::<u32>() * 2;
+        let weights_per_chunk = bitpacking::BitPacker4x::BLOCK_LEN;
+        let expected_weight_bytes = weights_per_chunk
+            .checked_mul(weight_size)
+            .ok_or_else(|| Self::invalid_data("sparse chunk weight size overflow"))?;
+
+        if WEIGHTS_OFFSET + expected_weight_bytes > chunk_size {
+            return Err(Self::invalid_data("invalid sparse chunk layout"));
+        }
+
+        let mut chunks = Vec::with_capacity(count);
+        for chunk_bytes in bytes.chunks_exact(chunk_size) {
+            let initial =
+                u32::from_le_bytes(chunk_bytes[0..4].try_into().expect("slice size checked"));
+            let offset =
+                u32::from_le_bytes(chunk_bytes[4..8].try_into().expect("slice size checked"));
+            let mut weights = Vec::with_capacity(weights_per_chunk);
+            for i in 0..weights_per_chunk {
+                let start = WEIGHTS_OFFSET + i * weight_size;
+                let end = start + weight_size;
+                weights.push(Self::decode_weight_le(&chunk_bytes[start..end])?);
+            }
+            let weights: [W; bitpacking::BitPacker4x::BLOCK_LEN] = weights
+                .try_into()
+                .map_err(|_| Self::invalid_data("invalid sparse chunk weight count"))?;
+            chunks.push(CompressedPostingChunk::from_parts(initial, offset, weights));
+        }
+        Ok(chunks)
+    }
+
+    fn write_chunks_le(
+        writer: &mut impl Write,
+        chunks: &[CompressedPostingChunk<W>],
+    ) -> std::io::Result<()> {
+        let weight_size = Self::weight_size().ok_or_else(|| {
+            Self::invalid_data(format!(
+                "unsupported sparse weight type {}",
+                std::any::type_name::<W>()
+            ))
+        })?;
+        let chunk_size = size_of::<CompressedPostingChunk<W>>();
+        const WEIGHTS_OFFSET: usize = size_of::<u32>() * 2;
+
+        for chunk in chunks {
+            let mut bytes = vec![0u8; chunk_size];
+            bytes[0..4].copy_from_slice(&chunk.initial().to_le_bytes());
+            bytes[4..8].copy_from_slice(&chunk.offset().to_le_bytes());
+            for (i, &weight) in chunk.weights().iter().enumerate() {
+                let start = WEIGHTS_OFFSET + i * weight_size;
+                let end = start + weight_size;
+                Self::encode_weight_le(weight, &mut bytes[start..end])?;
+            }
+            writer.write_all(&bytes)?;
+        }
+        Ok(())
+    }
+
+    fn decode_remainders_le(bytes: &[u8]) -> std::io::Result<Vec<GenericPostingElement<W>>> {
+        let remainder_size = size_of::<GenericPostingElement<W>>();
+        if remainder_size == 0 || !bytes.len().is_multiple_of(remainder_size) {
+            return Err(Self::invalid_data("invalid sparse remainders byte size"));
+        }
+
+        let weight_size = Self::weight_size().ok_or_else(|| {
+            Self::invalid_data(format!(
+                "unsupported sparse weight type {}",
+                std::any::type_name::<W>()
+            ))
+        })?;
+        let weight_offset = offset_of!(GenericPostingElement<W>, weight);
+        if weight_offset + weight_size > remainder_size {
+            return Err(Self::invalid_data("invalid sparse remainders layout"));
+        }
+
+        let mut remainders = Vec::with_capacity(bytes.len() / remainder_size);
+        for remainder in bytes.chunks_exact(remainder_size) {
+            let record_id =
+                u32::from_le_bytes(remainder[0..4].try_into().expect("slice size checked"));
+            let weight =
+                Self::decode_weight_le(&remainder[weight_offset..weight_offset + weight_size])?;
+            remainders.push(GenericPostingElement { record_id, weight });
+        }
+        Ok(remainders)
+    }
+
+    fn write_remainders_le(
+        writer: &mut impl Write,
+        remainders: &[GenericPostingElement<W>],
+    ) -> std::io::Result<()> {
+        let remainder_size = size_of::<GenericPostingElement<W>>();
+        let weight_size = Self::weight_size().ok_or_else(|| {
+            Self::invalid_data(format!(
+                "unsupported sparse weight type {}",
+                std::any::type_name::<W>()
+            ))
+        })?;
+        let weight_offset = offset_of!(GenericPostingElement<W>, weight);
+        if weight_offset + weight_size > remainder_size {
+            return Err(Self::invalid_data("invalid sparse remainders layout"));
+        }
+
+        for remainder in remainders {
+            let mut bytes = vec![0u8; remainder_size];
+            bytes[0..4].copy_from_slice(&remainder.record_id.to_le_bytes());
+            Self::encode_weight_le(
+                remainder.weight,
+                &mut bytes[weight_offset..weight_offset + weight_size],
+            )?;
+            writer.write_all(&bytes)?;
+        }
+        Ok(())
+    }
+
+    fn decode_postings_le(
+        data: &[u8],
+        posting_count: usize,
+    ) -> std::io::Result<Vec<CompressedPostingList<W>>> {
+        let header_bytes = posting_count
+            .checked_mul(Self::HEADER_SIZE)
+            .ok_or_else(|| Self::invalid_data("sparse header size overflow"))?;
+        if header_bytes > data.len() {
+            return Err(Self::invalid_data(
+                "sparse header region exceeds file length",
+            ));
+        }
+
+        let mut headers = Vec::with_capacity(posting_count);
+        for i in 0..posting_count {
+            let start = i * Self::HEADER_SIZE;
+            let end = start + Self::HEADER_SIZE;
+            headers.push(Self::decode_posting_header_le(&data[start..end])?);
+        }
+
+        let chunk_size = size_of::<CompressedPostingChunk<W>>();
+        let mut postings = Vec::with_capacity(posting_count);
+        for (i, header) in headers.iter().enumerate() {
+            let ids_start = usize::try_from(header.ids_start).map_err(|_| {
+                Self::invalid_data("ids_start does not fit target architecture address space")
+            })?;
+            let ids_len = header.ids_len as usize;
+            let chunks_count = header.chunks_count as usize;
+            let ids_end = ids_start
+                .checked_add(ids_len)
+                .ok_or_else(|| Self::invalid_data("sparse id_data size overflow"))?;
+            let chunks_end = ids_end
+                .checked_add(
+                    chunk_size
+                        .checked_mul(chunks_count)
+                        .ok_or_else(|| Self::invalid_data("sparse chunks size overflow"))?,
+                )
+                .ok_or_else(|| Self::invalid_data("sparse chunks end overflow"))?;
+            let remainders_end = if i + 1 < headers.len() {
+                usize::try_from(headers[i + 1].ids_start).map_err(|_| {
+                    Self::invalid_data(
+                        "next ids_start does not fit target architecture address space",
+                    )
+                })?
+            } else {
+                data.len()
+            };
+
+            if !(ids_start <= ids_end
+                && ids_end <= chunks_end
+                && chunks_end <= remainders_end
+                && remainders_end <= data.len())
+            {
+                return Err(Self::invalid_data(
+                    "invalid sparse posting boundaries in mmap file",
+                ));
+            }
+
+            let id_data = data[ids_start..ids_end].to_vec();
+            let chunks = Self::decode_chunks_le(&data[ids_end..chunks_end], chunks_count)?;
+            let remainders = Self::decode_remainders_le(&data[chunks_end..remainders_end])?;
+
+            postings.push(CompressedPostingList::from_parts(
+                id_data,
+                chunks,
+                remainders,
+                header.last_id.checked_sub(1),
+                header.quantization_params,
+            ));
+        }
+
+        Ok(postings)
+    }
+
     pub fn convert_and_save<P: AsRef<Path>>(
         index: &InvertedIndexCompressedImmutableRam<W>,
         path: P,
@@ -284,34 +786,63 @@ impl<W: Weight> InvertedIndexCompressedMmap<W> {
 
         let mut buf = BufWriter::new(file);
 
-        // Save posting headers
-        let mut offset: usize = total_posting_headers_size;
-        for posting in index.postings.as_slice() {
-            let store_size = posting.view(&hw_counter).store_size();
-            let posting_header = PostingListFileHeader::<W> {
-                ids_start: offset as u64,
-                ids_len: store_size.id_data_bytes as u32,
-                chunks_count: store_size.chunks_count as u32,
-                last_id: posting.view(&hw_counter).last_id().map_or(0, |id| id + 1),
-                quantization_params: posting.view(&hw_counter).multiplier(),
-            };
-            // TODO Safety
-            #[expect(deprecated, reason = "legacy code")]
-            buf.write_all(unsafe { transmute_to_u8(&posting_header) })?;
-            offset += store_size.total;
-        }
+        if cfg!(target_endian = "big") {
+            // Save posting headers in little-endian while preserving existing repr(C) layout size.
+            let mut offset: usize = total_posting_headers_size;
+            for posting in index.postings.as_slice() {
+                let posting_view = posting.view(&hw_counter);
+                let store_size = posting_view.store_size();
+                let posting_header = PostingListFileHeaderDecoded::<W> {
+                    ids_start: offset as u64,
+                    ids_len: store_size.id_data_bytes as u32,
+                    chunks_count: store_size.chunks_count as u32,
+                    last_id: posting_view.last_id().map_or(0, |id| id + 1),
+                    quantization_params: posting_view.multiplier(),
+                };
+                let mut posting_header_bytes = vec![0u8; Self::HEADER_SIZE];
+                Self::encode_posting_header_le(&posting_header, &mut posting_header_bytes)?;
+                buf.write_all(&posting_header_bytes)?;
+                offset += store_size.total;
+            }
 
-        // Save posting elements
-        for posting in index.postings.as_slice() {
-            let posting_view = posting.view(&hw_counter);
-            let (id_data, chunks, remainders) = posting_view.parts();
-            buf.write_all(id_data)?;
-            // TODO Safety
-            #[expect(deprecated, reason = "legacy code")]
-            buf.write_all(unsafe { transmute_to_u8_slice(chunks) })?;
-            // TODO Safety
-            #[expect(deprecated, reason = "legacy code")]
-            buf.write_all(unsafe { transmute_to_u8_slice(remainders) })?;
+            // Save posting payloads in little-endian while preserving existing struct layout.
+            for posting in index.postings.as_slice() {
+                let posting_view = posting.view(&hw_counter);
+                let (id_data, chunks, remainders) = posting_view.parts();
+                buf.write_all(id_data)?;
+                Self::write_chunks_le(&mut buf, chunks)?;
+                Self::write_remainders_le(&mut buf, remainders)?;
+            }
+        } else {
+            // Save posting headers
+            let mut offset: usize = total_posting_headers_size;
+            for posting in index.postings.as_slice() {
+                let store_size = posting.view(&hw_counter).store_size();
+                let posting_header = PostingListFileHeader::<W> {
+                    ids_start: offset as u64,
+                    ids_len: store_size.id_data_bytes as u32,
+                    chunks_count: store_size.chunks_count as u32,
+                    last_id: posting.view(&hw_counter).last_id().map_or(0, |id| id + 1),
+                    quantization_params: posting.view(&hw_counter).multiplier(),
+                };
+                // TODO Safety
+                #[expect(deprecated, reason = "legacy code")]
+                buf.write_all(unsafe { transmute_to_u8(&posting_header) })?;
+                offset += store_size.total;
+            }
+
+            // Save posting elements
+            for posting in index.postings.as_slice() {
+                let posting_view = posting.view(&hw_counter);
+                let (id_data, chunks, remainders) = posting_view.parts();
+                buf.write_all(id_data)?;
+                // TODO Safety
+                #[expect(deprecated, reason = "legacy code")]
+                buf.write_all(unsafe { transmute_to_u8_slice(chunks) })?;
+                // TODO Safety
+                #[expect(deprecated, reason = "legacy code")]
+                buf.write_all(unsafe { transmute_to_u8_slice(remainders) })?;
+            }
         }
 
         // Explicitly fsync file contents to ensure durability
@@ -335,6 +866,11 @@ impl<W: Weight> InvertedIndexCompressedMmap<W> {
                 AdviceSetting::Global,
                 false,
             )?),
+            decoded_postings: if cfg!(target_endian = "big") {
+                Some(index.postings.as_slice().to_vec())
+            } else {
+                None
+            },
             file_header,
             _phantom: PhantomData,
         })
@@ -353,9 +889,19 @@ impl<W: Weight> InvertedIndexCompressedMmap<W> {
             false,
         )?;
 
+        let decoded_postings = if cfg!(target_endian = "big") {
+            Some(Self::decode_postings_le(
+                mmap.as_ref(),
+                file_header.posting_count,
+            )?)
+        } else {
+            None
+        };
+
         let mut index = Self {
             path: path.as_ref().to_owned(),
             mmap: Arc::new(mmap),
+            decoded_postings,
             file_header,
             _phantom: PhantomData,
         };
@@ -395,6 +941,7 @@ impl<W: Weight> InvertedIndexCompressedMmap<W> {
 
 #[cfg(test)]
 mod tests {
+    use fs_err as fs;
     use tempfile::Builder;
 
     use super::*;
@@ -418,6 +965,30 @@ mod tests {
             let ram_parts = posting_list_ram.parts();
 
             assert_eq!(mmap_parts, ram_parts);
+        }
+    }
+
+    fn compare_with_decoded_from_raw_file<W: Weight>(
+        inverted_index_ram: &InvertedIndexCompressedImmutableRam<W>,
+        path: &Path,
+        posting_count: usize,
+    ) {
+        let hw_counter = HardwareCounterCell::new();
+        let bytes = fs::read(InvertedIndexCompressedMmap::<W>::index_file_path(path)).unwrap();
+        let decoded =
+            InvertedIndexCompressedMmap::<W>::decode_postings_le(&bytes, posting_count).unwrap();
+
+        assert_eq!(decoded.len(), posting_count);
+        for (id, posting_list_decoded) in decoded.iter().enumerate() {
+            let posting_list_ram = inverted_index_ram
+                .postings
+                .get(id)
+                .unwrap()
+                .view(&hw_counter);
+            assert_eq!(
+                posting_list_decoded.view(&hw_counter).parts(),
+                posting_list_ram.parts()
+            );
         }
     }
 
@@ -461,6 +1032,11 @@ mod tests {
             .unwrap();
 
             compare_indexes(&inverted_index_ram, &inverted_index_mmap);
+            compare_with_decoded_from_raw_file(
+                &inverted_index_ram,
+                tmp_dir_path.path(),
+                inverted_index_mmap.file_header.posting_count,
+            );
         }
         let inverted_index_mmap = InvertedIndexCompressedMmap::<W>::load(&tmp_dir_path).unwrap();
         // posting_count: 0th entry is always empty + 1st + 2nd + 3rd + 4th empty + 5th

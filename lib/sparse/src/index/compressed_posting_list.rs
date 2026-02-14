@@ -60,7 +60,49 @@ pub struct CompressedPostingChunk<W> {
     weights: [W; CHUNK_SIZE],
 }
 
+impl<W> CompressedPostingChunk<W> {
+    pub(crate) fn from_parts(
+        initial: PointOffsetType,
+        offset: u32,
+        weights: [W; CHUNK_SIZE],
+    ) -> Self {
+        Self {
+            initial,
+            offset,
+            weights,
+        }
+    }
+
+    pub(crate) fn initial(&self) -> PointOffsetType {
+        self.initial
+    }
+
+    pub(crate) fn offset(&self) -> u32 {
+        self.offset
+    }
+
+    pub(crate) fn weights(&self) -> &[W; CHUNK_SIZE] {
+        &self.weights
+    }
+}
+
 impl<W: Weight> CompressedPostingList<W> {
+    pub(crate) fn from_parts(
+        id_data: Vec<u8>,
+        chunks: Vec<CompressedPostingChunk<W>>,
+        remainders: Vec<GenericPostingElement<W>>,
+        last_id: Option<PointOffsetType>,
+        quantization_params: W::QuantizationParams,
+    ) -> Self {
+        Self {
+            id_data,
+            chunks,
+            remainders,
+            last_id,
+            quantization_params,
+        }
+    }
+
     pub(super) fn view<'a>(
         &'a self,
         hw_counter: &'a HardwareCounterCell,
