@@ -556,4 +556,43 @@ mod tests {
         assert!(inverted_index_mmap.get(&7).is_none());
         assert!(inverted_index_mmap.get(&100).is_none());
     }
+
+    #[test]
+    fn test_decode_postings_le_rejects_truncated_header() {
+        let mut builder = InvertedIndexBuilder::new();
+        builder.add(1, [(1, 10.0)].into());
+        let inverted_index_ram = builder.build();
+        let tmp_dir_path = Builder::new()
+            .prefix("test_index_dir_hdr")
+            .tempdir()
+            .unwrap();
+        let inverted_index_mmap =
+            InvertedIndexMmap::convert_and_save(&inverted_index_ram, &tmp_dir_path).unwrap();
+
+        let posting_count = inverted_index_mmap.file_header.posting_count;
+        let mut bytes = fs::read(InvertedIndexMmap::index_file_path(tmp_dir_path.path())).unwrap();
+        bytes.truncate(posting_count * POSTING_HEADER_SIZE - 1);
+
+        assert!(InvertedIndexMmap::decode_postings_le(&bytes, posting_count).is_err());
+    }
+
+    #[test]
+    fn test_decode_postings_le_rejects_corrupt_offsets() {
+        let mut builder = InvertedIndexBuilder::new();
+        builder.add(1, [(1, 10.0)].into());
+        let inverted_index_ram = builder.build();
+        let tmp_dir_path = Builder::new()
+            .prefix("test_index_dir_off")
+            .tempdir()
+            .unwrap();
+        let inverted_index_mmap =
+            InvertedIndexMmap::convert_and_save(&inverted_index_ram, &tmp_dir_path).unwrap();
+
+        let posting_count = inverted_index_mmap.file_header.posting_count;
+        let mut bytes = fs::read(InvertedIndexMmap::index_file_path(tmp_dir_path.path())).unwrap();
+        let bogus_start = bytes.len() as u64 + 1024;
+        bytes[0..8].copy_from_slice(&bogus_start.to_le_bytes());
+
+        assert!(InvertedIndexMmap::decode_postings_le(&bytes, posting_count).is_err());
+    }
 }
