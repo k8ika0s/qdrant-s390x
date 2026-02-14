@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::mem::{self, MaybeUninit, size_of, transmute};
+use std::mem::{MaybeUninit, size_of, transmute};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -28,6 +28,7 @@ use crate::vector_storage::{AccessPattern, Random, Sequential};
 const HEADER_SIZE: usize = 4;
 const VECTORS_HEADER: &[u8; HEADER_SIZE] = b"data";
 const DELETED_HEADER: &[u8; HEADER_SIZE] = b"drop";
+const DELETED_LAYOUT_BLOCK_BYTES: usize = size_of::<u64>();
 
 /// Mem-mapped file for dense vectors
 #[derive(Debug)]
@@ -289,17 +290,28 @@ fn ensure_mmap_file_size(path: &Path, header: &[u8], size: Option<u64>) -> Opera
 /// Get start position of flags `BitSlice` in deleted mmap.
 #[inline]
 const fn deleted_mmap_data_start() -> usize {
-    let align = mem::align_of::<usize>();
-    HEADER_SIZE.div_ceil(align) * align
+    HEADER_SIZE.div_ceil(DELETED_LAYOUT_BLOCK_BYTES) * DELETED_LAYOUT_BLOCK_BYTES
 }
 
 /// Calculate size for deleted mmap to hold the given number of vectors.
 ///
 /// The mmap will hold a file header and an aligned `BitSlice`.
 fn deleted_mmap_size(num: usize) -> usize {
-    let unit_size = mem::size_of::<usize>();
     let num_bytes = num.div_ceil(8);
-    let num_usizes = num_bytes.div_ceil(unit_size);
-    let data_size = num_usizes * unit_size;
+    let data_size = num_bytes.next_multiple_of(DELETED_LAYOUT_BLOCK_BYTES);
     deleted_mmap_data_start() + data_size
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_deleted_mmap_layout_is_fixed_width() {
+        assert_eq!(deleted_mmap_data_start(), 8);
+        assert_eq!(deleted_mmap_size(0), 8);
+        assert_eq!(deleted_mmap_size(1), 16);
+        assert_eq!(deleted_mmap_size(64), 16);
+        assert_eq!(deleted_mmap_size(65), 24);
+    }
 }
