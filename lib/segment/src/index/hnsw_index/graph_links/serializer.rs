@@ -3,24 +3,24 @@ use std::cmp::Reverse;
 use std::io::{Seek, Write};
 
 use common::bitpacking::packed_bits;
-use common::bitpacking_links::{MIN_BITS_PER_VALUE, pack_links};
+use common::bitpacking_links::{pack_links, MIN_BITS_PER_VALUE};
 use common::bitpacking_ordered;
 use common::types::PointOffsetType;
 use common::zeros::WriteZerosExt;
 use integer_encoding::{VarInt, VarIntWriter};
 use itertools::Either;
-use zerocopy::IntoBytes as AsBytes;
 use zerocopy::little_endian::U64 as LittleU64;
+use zerocopy::IntoBytes as AsBytes;
 
-use super::GraphLinksFormatParam;
 use super::header::{
-    HEADER_VERSION_COMPRESSED, HEADER_VERSION_PLAIN, HeaderCompressed, HeaderPlain,
+    HeaderCompressed, HeaderPlain, HEADER_VERSION_COMPRESSED, HEADER_VERSION_PLAIN,
 };
+use super::GraphLinksFormatParam;
 use crate::common::operation_error::{OperationError, OperationResult};
-use crate::index::hnsw_index::HnswM;
 use crate::index::hnsw_index::graph_links::header::{
-    HEADER_VERSION_COMPRESSED_WITH_VECTORS, HeaderCompressedWithVectors, PackedVectorLayout,
+    HeaderCompressedWithVectors, PackedVectorLayout, HEADER_VERSION_COMPRESSED_WITH_VECTORS,
 };
+use crate::index::hnsw_index::HnswM;
 
 pub fn serialize_graph_links<W: Write + Seek>(
     mut edges: Vec<Vec<Vec<PointOffsetType>>>,
@@ -73,11 +73,7 @@ pub fn serialize_graph_links<W: Write + Seek>(
     {
         let mut suffix_sum = point_count_by_level.iter().sum::<u64>();
         for &value in point_count_by_level.iter() {
-            if matches!(format_param, GraphLinksFormatParam::Plain) {
-                writer.write_all(&total_offsets_len.to_le_bytes())?;
-            } else {
-                writer.write_all(total_offsets_len.as_bytes())?;
-            }
+            writer.write_all(&total_offsets_len.to_le_bytes())?;
             total_offsets_len += suffix_sum;
             suffix_sum -= value;
         }
@@ -90,11 +86,7 @@ pub fn serialize_graph_links<W: Write + Seek>(
         for i in 0..back_index.len() {
             reindex[back_index[i] as usize] = i as PointOffsetType;
         }
-        if matches!(format_param, GraphLinksFormatParam::Plain) {
-            write_u32_slice_le(writer, &reindex)?;
-        } else {
-            writer.write_all(reindex.as_bytes())?;
-        }
+        write_u32_slice_le(writer, &reindex)?;
     }
 
     // 4. Write neighbors padding (if applicable)

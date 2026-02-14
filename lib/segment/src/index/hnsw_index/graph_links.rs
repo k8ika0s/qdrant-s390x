@@ -513,6 +513,56 @@ mod tests {
     }
 
     #[test]
+    fn test_compressed_serialization_has_little_endian_versioned_header() {
+        let hnsw_m = HnswM::new2(8);
+        let links = vec![vec![vec![1]], vec![vec![0]]];
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        serialize_graph_links(
+            links,
+            GraphLinksFormatParam::Compressed,
+            hnsw_m,
+            &mut cursor,
+        )
+        .unwrap();
+        let bytes = cursor.into_inner();
+
+        let version_offset = size_of::<u64>();
+        let version = u64::from_le_bytes(
+            bytes[version_offset..version_offset + size_of::<u64>()]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(version, super::header::HEADER_VERSION_COMPRESSED);
+    }
+
+    #[test]
+    fn test_compressed_with_vectors_serialization_has_little_endian_versioned_header() {
+        let hnsw_m = HnswM::new2(8);
+        let links = vec![vec![vec![1]], vec![vec![0]]];
+        let vectors = TestGraphLinksVectors::new(2, 8, 8);
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        serialize_graph_links(
+            links,
+            GraphLinksFormatParam::CompressedWithVectors(&vectors),
+            hnsw_m,
+            &mut cursor,
+        )
+        .unwrap();
+        let bytes = cursor.into_inner();
+
+        let version_offset = size_of::<u64>();
+        let version = u64::from_le_bytes(
+            bytes[version_offset..version_offset + size_of::<u64>()]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(
+            version,
+            super::header::HEADER_VERSION_COMPRESSED_WITH_VECTORS
+        );
+    }
+
+    #[test]
     fn test_load_plain_legacy_big_endian_fixture() {
         let path = Builder::new().prefix("graph_dir").tempdir().unwrap();
         let links_file = path.path().join("legacy_plain_be_links.bin");
@@ -523,6 +573,92 @@ mod tests {
         assert_eq!(links.format(), GraphLinksFormat::Plain);
         assert_eq!(links.links(0, 0).collect::<Vec<_>>(), vec![1]);
         assert_eq!(links.links(1, 0).collect::<Vec<_>>(), vec![0]);
+    }
+
+    #[test]
+    fn test_load_compressed_legacy_big_endian_fixture() {
+        let path = Builder::new().prefix("graph_dir").tempdir().unwrap();
+        let links_file = path.path().join("legacy_compressed_be_links.bin");
+        fs_err::write(&links_file, legacy_compressed_big_endian_fixture()).unwrap();
+
+        let links =
+            GraphLinks::load_from_file(&links_file, true, GraphLinksFormat::Compressed).unwrap();
+
+        assert_eq!(links.format(), GraphLinksFormat::Compressed);
+        assert_eq!(links.links(0, 0).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(links.links(1, 0).collect::<Vec<_>>(), vec![0]);
+    }
+
+    #[test]
+    fn test_load_compressed_with_vectors_legacy_big_endian_fixture() {
+        let path = Builder::new().prefix("graph_dir").tempdir().unwrap();
+        let links_file = path
+            .path()
+            .join("legacy_compressed_with_vectors_be_links.bin");
+        let links = vec![vec![vec![1]], vec![vec![0]]];
+        let vectors = TestGraphLinksVectors::new(2, 8, 8);
+        fs_err::write(
+            &links_file,
+            legacy_compressed_with_vectors_big_endian_fixture(links.clone(), &vectors),
+        )
+        .unwrap();
+
+        let loaded =
+            GraphLinks::load_from_file(&links_file, true, GraphLinksFormat::CompressedWithVectors)
+                .unwrap();
+
+        assert_eq!(loaded.format(), GraphLinksFormat::CompressedWithVectors);
+        check_links(links, &loaded, &Some(vectors));
+    }
+
+    #[test]
+    fn test_load_plain_rejects_zero_levels_with_points() {
+        let hnsw_m = HnswM::new2(8);
+        let links = vec![vec![vec![1]], vec![vec![0]]];
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        serialize_graph_links(links, GraphLinksFormatParam::Plain, hnsw_m, &mut cursor).unwrap();
+        let mut bytes = cursor.into_inner();
+
+        write_u64_le_at(&mut bytes, 1, 0); // levels_count
+
+        let path = Builder::new().prefix("graph_dir").tempdir().unwrap();
+        let links_file = path.path().join("invalid_plain_links.bin");
+        fs_err::write(&links_file, bytes).unwrap();
+
+        let err = GraphLinks::load_from_file(&links_file, true, GraphLinksFormat::Plain)
+            .err()
+            .expect("invalid plain layout must fail");
+        assert!(err
+            .to_string()
+            .contains("Invalid plain GraphLinks level/point counts"));
+    }
+
+    #[test]
+    fn test_load_compressed_rejects_zero_levels_with_points() {
+        let hnsw_m = HnswM::new2(8);
+        let links = vec![vec![vec![1]], vec![vec![0]]];
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        serialize_graph_links(
+            links,
+            GraphLinksFormatParam::Compressed,
+            hnsw_m,
+            &mut cursor,
+        )
+        .unwrap();
+        let mut bytes = cursor.into_inner();
+
+        write_u64_le_at(&mut bytes, 2, 0); // levels_count
+
+        let path = Builder::new().prefix("graph_dir").tempdir().unwrap();
+        let links_file = path.path().join("invalid_compressed_links.bin");
+        fs_err::write(&links_file, bytes).unwrap();
+
+        let err = GraphLinks::load_from_file(&links_file, true, GraphLinksFormat::Compressed)
+            .err()
+            .expect("invalid compressed layout must fail");
+        assert!(err
+            .to_string()
+            .contains("Invalid compressed GraphLinks level/point counts"));
     }
 
     fn legacy_plain_big_endian_fixture() -> Vec<u8> {
@@ -550,6 +686,110 @@ mod tests {
         bytes.extend_from_slice(&2_u64.to_be_bytes());
 
         bytes
+    }
+
+    fn legacy_compressed_big_endian_fixture() -> Vec<u8> {
+        let hnsw_m = HnswM::new2(8);
+        let links = vec![vec![vec![1]], vec![vec![0]]];
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        serialize_graph_links(
+            links,
+            GraphLinksFormatParam::Compressed,
+            hnsw_m,
+            &mut cursor,
+        )
+        .unwrap();
+        let mut bytes = cursor.into_inner();
+
+        // Mark as legacy compressed format.
+        write_u64_le_at(
+            &mut bytes,
+            1,
+            super::header::HEADER_VERSION_COMPRESSED_LEGACY,
+        );
+
+        let point_count = read_u64_le_at(&bytes, 0) as usize;
+        let levels_count = read_u64_le_at(&bytes, 2) as usize;
+        let header_size = size_of::<super::header::HeaderCompressed>();
+
+        // Legacy compressed level offsets/reindex were native-endian.
+        let mut pos = header_size;
+        for _ in 0..levels_count {
+            let value = u64::from_le_bytes(bytes[pos..pos + size_of::<u64>()].try_into().unwrap());
+            bytes[pos..pos + size_of::<u64>()].copy_from_slice(&value.to_be_bytes());
+            pos += size_of::<u64>();
+        }
+        for _ in 0..point_count {
+            let value = u32::from_le_bytes(bytes[pos..pos + size_of::<u32>()].try_into().unwrap());
+            bytes[pos..pos + size_of::<u32>()].copy_from_slice(&value.to_be_bytes());
+            pos += size_of::<u32>();
+        }
+
+        bytes
+    }
+
+    fn legacy_compressed_with_vectors_big_endian_fixture(
+        links: Vec<Vec<Vec<PointOffsetType>>>,
+        vectors: &TestGraphLinksVectors,
+    ) -> Vec<u8> {
+        let hnsw_m = HnswM::new2(8);
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        serialize_graph_links(
+            links,
+            GraphLinksFormatParam::CompressedWithVectors(vectors),
+            hnsw_m,
+            &mut cursor,
+        )
+        .unwrap();
+        let mut bytes = cursor.into_inner();
+
+        // Mark as legacy compressed-with-vectors format.
+        write_u64_le_at(
+            &mut bytes,
+            1,
+            super::header::HEADER_VERSION_COMPRESSED_WITH_VECTORS_LEGACY,
+        );
+
+        let point_count = read_u64_le_at(&bytes, 0) as usize;
+        let levels_count = read_u64_le_at(&bytes, 2) as usize;
+        let header_size = size_of::<super::header::HeaderCompressedWithVectors>();
+
+        // Legacy compressed-with-vectors level offsets/reindex were native-endian.
+        let mut pos = header_size;
+        for _ in 0..levels_count {
+            rewrite_u64_le_to_be_at(&mut bytes, pos);
+            pos += size_of::<u64>();
+        }
+        for _ in 0..point_count {
+            rewrite_u32_le_to_be_at(&mut bytes, pos);
+            pos += size_of::<u32>();
+        }
+
+        bytes
+    }
+
+    fn read_u64_le_at(bytes: &[u8], field_idx: usize) -> u64 {
+        let start = field_idx * size_of::<u64>();
+        let end = start + size_of::<u64>();
+        u64::from_le_bytes(bytes[start..end].try_into().unwrap())
+    }
+
+    fn write_u64_le_at(bytes: &mut [u8], field_idx: usize, value: u64) {
+        let start = field_idx * size_of::<u64>();
+        let end = start + size_of::<u64>();
+        bytes[start..end].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn rewrite_u64_le_to_be_at(bytes: &mut [u8], start: usize) {
+        let end = start + size_of::<u64>();
+        let value = u64::from_le_bytes(bytes[start..end].try_into().unwrap());
+        bytes[start..end].copy_from_slice(&value.to_be_bytes());
+    }
+
+    fn rewrite_u32_le_to_be_at(bytes: &mut [u8], start: usize) {
+        let end = start + size_of::<u32>();
+        let value = u32::from_le_bytes(bytes[start..end].try_into().unwrap());
+        bytes[start..end].copy_from_slice(&value.to_be_bytes());
     }
 
     #[rstest]

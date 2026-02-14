@@ -6,7 +6,7 @@ use std::num::NonZero;
 
 use common::bitpacking::packed_bits;
 use common::bitpacking_links::{
-    MIN_BITS_PER_VALUE, PackedLinksIterator, iterate_packed_links, packed_links_size,
+    iterate_packed_links, packed_links_size, PackedLinksIterator, MIN_BITS_PER_VALUE,
 };
 use common::bitpacking_ordered;
 use common::types::PointOffsetType;
@@ -14,15 +14,15 @@ use integer_encoding::VarInt as _;
 use itertools::{Either, Itertools as _};
 use zerocopy::{FromBytes, Immutable};
 
-use super::GraphLinksFormat;
 use super::header::{
-    HEADER_VERSION_COMPRESSED, HEADER_VERSION_PLAIN, HeaderCompressed, HeaderPlain,
+    HeaderCompressed, HeaderPlain, HEADER_VERSION_COMPRESSED, HEADER_VERSION_COMPRESSED_LEGACY,
+    HEADER_VERSION_COMPRESSED_WITH_VECTORS, HEADER_VERSION_COMPRESSED_WITH_VECTORS_LEGACY,
+    HEADER_VERSION_PLAIN,
 };
+use super::GraphLinksFormat;
 use crate::common::operation_error::{OperationError, OperationResult};
+use crate::index::hnsw_index::graph_links::header::HeaderCompressedWithVectors;
 use crate::index::hnsw_index::HnswM;
-use crate::index::hnsw_index::graph_links::header::{
-    HEADER_VERSION_COMPRESSED_WITH_VECTORS, HeaderCompressedWithVectors,
-};
 
 /// An (almost) zero-copy, non-owning view into serialized graph links stored
 /// as a `&[u8]` slice.
@@ -191,26 +191,119 @@ impl GraphLinksView<'_> {
     fn load_compressed(data: &[u8]) -> OperationResult<GraphLinksView<'_>> {
         let (header, data) =
             HeaderCompressed::ref_from_prefix(data).map_err(|_| error_unsufficent_size())?;
-        debug_assert_eq!(header.version.get(), HEADER_VERSION_COMPRESSED);
-        let (level_offsets, data) = read_level_offsets(
-            data,
-            header.levels_count.get(),
-            header.offsets_parameters.length.get(),
+        let endians_to_try: &[PlainEndian] = match header.version.get() {
+            HEADER_VERSION_COMPRESSED => &[PlainEndian::Little],
+            HEADER_VERSION_COMPRESSED_LEGACY => &[PlainEndian::Little, PlainEndian::Big],
+            version => {
+                return Err(OperationError::service_error(format!(
+                    "Unsupported compressed GraphLinks version: {version:#x}"
+                )));
+            }
+        };
+
+        let mut first_error = None;
+        for endian in endians_to_try {
+            match Self::load_compressed_with_endian(data, &header, *endian) {
+                Ok(view) => return Ok(view),
+                Err(err) => {
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                }
+            }
+        }
+
+        Err(first_error.unwrap_or_else(|| {
+            OperationError::service_error("Failed to decode compressed GraphLinks file")
+        }))
+    }
+
+    fn load_compressed_with_vectors(data: &[u8]) -> OperationResult<GraphLinksView<'_>> {
+        let total_len = data.len();
+
+        let (header, data) = HeaderCompressedWithVectors::ref_from_prefix(data)
+            .map_err(|_| error_unsufficent_size())?;
+        let endians_to_try: &[PlainEndian] = match header.version.get() {
+            HEADER_VERSION_COMPRESSED_WITH_VECTORS => &[PlainEndian::Little],
+            HEADER_VERSION_COMPRESSED_WITH_VECTORS_LEGACY => {
+                &[PlainEndian::Little, PlainEndian::Big]
+            }
+            version => {
+                return Err(OperationError::service_error(format!(
+                    "Unsupported compressed-with-vectors GraphLinks version: {version:#x}"
+                )));
+            }
+        };
+
+        let base_vector_layout = header.base_vector_layout.try_into_layout()?;
+        let link_vector_layout = header.link_vector_layout.try_into_layout()?;
+
+        let mut first_error = None;
+        for endian in endians_to_try {
+            match Self::load_compressed_with_vectors_with_endian(
+                data,
+                total_len,
+                &header,
+                base_vector_layout,
+                link_vector_layout,
+                *endian,
+            ) {
+                Ok(view) => return Ok(view),
+                Err(err) => {
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                }
+            }
+        }
+
+        Err(first_error.unwrap_or_else(|| {
+            OperationError::service_error(
+                "Failed to decode compressed-with-vectors GraphLinks file",
+            )
+        }))
+    }
+
+    fn load_compressed_with_endian<'a>(
+        data: &'a [u8],
+        header: &HeaderCompressed,
+        endian: PlainEndian,
+    ) -> OperationResult<GraphLinksView<'a>> {
+        let levels_count = header.levels_count.get();
+        let point_count = header.point_count.get();
+        let total_offset_count = header.offsets_parameters.length.get();
+
+        let (level_offsets, data) =
+            read_level_offsets_with_endian(data, levels_count, total_offset_count, endian)?;
+        let (reindex, data) = get_point_offsets_with_endian(data, point_count, endian)?;
+        validate_compressed_layout(
+            &level_offsets,
+            reindex.as_ref(),
+            levels_count,
+            point_count,
+            total_offset_count,
         )?;
-        let (reindex, data) = get_slice::<PointOffsetType>(data, header.point_count.get())?;
+
         let (neighbors, data) = get_slice::<u8>(data, header.total_neighbors_bytes.get())?;
         let (offsets, _bytes) = bitpacking_ordered::Reader::new(header.offsets_parameters, data)
             .map_err(|e| {
                 OperationError::service_error(format!("Can't create decompressor: {e}"))
             })?;
+        validate_compressed_offsets_reader(
+            &offsets,
+            total_offset_count,
+            header.total_neighbors_bytes.get(),
+            "compressed",
+        )?;
+
         Ok(GraphLinksView {
-            reindex: Cow::Borrowed(reindex),
+            reindex,
             compression: CompressionInfo::Compressed {
                 neighbors,
                 offsets,
                 hnsw_m: HnswM::new(header.m.get() as usize, header.m0.get() as usize),
                 bits_per_unsorted: MIN_BITS_PER_VALUE.max(packed_bits(
-                    u32::try_from(header.point_count.get().saturating_sub(1)).map_err(|_| {
+                    u32::try_from(point_count.saturating_sub(1)).map_err(|_| {
                         OperationError::service_error("Too many points in GraphLinks file")
                     })?,
                 )),
@@ -219,22 +312,29 @@ impl GraphLinksView<'_> {
         })
     }
 
-    fn load_compressed_with_vectors(data: &[u8]) -> OperationResult<GraphLinksView<'_>> {
-        let total_len = data.len();
+    fn load_compressed_with_vectors_with_endian<'a>(
+        data: &'a [u8],
+        total_len: usize,
+        header: &HeaderCompressedWithVectors,
+        base_vector_layout: Layout,
+        link_vector_layout: Layout,
+        endian: PlainEndian,
+    ) -> OperationResult<GraphLinksView<'a>> {
+        let levels_count = header.levels_count.get();
+        let point_count = header.point_count.get();
+        let total_offset_count = header.offsets_parameters.length.get();
 
-        let (header, data) = HeaderCompressedWithVectors::ref_from_prefix(data)
-            .map_err(|_| error_unsufficent_size())?;
-        debug_assert_eq!(header.version.get(), HEADER_VERSION_COMPRESSED_WITH_VECTORS);
-
-        let base_vector_layout = header.base_vector_layout.try_into_layout()?;
-        let link_vector_layout = header.link_vector_layout.try_into_layout()?;
-
-        let (level_offsets, data) = read_level_offsets(
-            data,
-            header.levels_count.get(),
-            header.offsets_parameters.length.get(),
+        let (level_offsets, data) =
+            read_level_offsets_with_endian(data, levels_count, total_offset_count, endian)?;
+        let (reindex, data) = get_point_offsets_with_endian(data, point_count, endian)?;
+        validate_compressed_layout(
+            &level_offsets,
+            reindex.as_ref(),
+            levels_count,
+            point_count,
+            total_offset_count,
         )?;
-        let (reindex, data) = get_slice::<PointOffsetType>(data, header.point_count.get())?;
+
         let (_, data) = get_slice::<u8>(data, {
             let pos = total_len - data.len();
             let alignment = std::cmp::max(link_vector_layout.align(), base_vector_layout.align());
@@ -245,14 +345,21 @@ impl GraphLinksView<'_> {
             .map_err(|e| {
                 OperationError::service_error(format!("Can't create decompressor: {e}"))
             })?;
+        validate_compressed_offsets_reader(
+            &offsets,
+            total_offset_count,
+            header.total_neighbors_bytes.get(),
+            "compressed-with-vectors",
+        )?;
+
         Ok(GraphLinksView {
-            reindex: Cow::Borrowed(reindex),
+            reindex,
             compression: CompressionInfo::CompressedWithVectors {
                 neighbors,
                 offsets,
                 hnsw_m: HnswM::new(header.m.get() as usize, header.m0.get() as usize),
                 bits_per_unsorted: MIN_BITS_PER_VALUE.max(packed_bits(
-                    u32::try_from(header.point_count.get().saturating_sub(1)).map_err(|_| {
+                    u32::try_from(point_count.saturating_sub(1)).map_err(|_| {
                         OperationError::service_error("Too many points in GraphLinks file")
                     })?,
                 )),
@@ -364,12 +471,10 @@ impl GraphLinksView<'_> {
                 let mut base_vector: &[u8] = &[];
                 if level == 0 {
                     base_vector = &neighbors[pos..pos + base_vector_layout.size()];
-                    debug_assert!(
-                        base_vector
-                            .as_ptr()
-                            .addr()
-                            .is_multiple_of(base_vector_layout.align())
-                    );
+                    debug_assert!(base_vector
+                        .as_ptr()
+                        .addr()
+                        .is_multiple_of(base_vector_layout.align()));
                     pos += base_vector_layout.size();
                 }
 
@@ -535,6 +640,10 @@ fn validate_plain_layout(
     reindex: &[u32],
     offsets: &[u64],
 ) -> OperationResult<()> {
+    let point_count = usize::try_from(header.point_count).map_err(|_| error_unsufficent_size())?;
+    let levels_count =
+        usize::try_from(header.levels_count).map_err(|_| error_unsufficent_size())?;
+
     if reindex.len() != usize::try_from(header.point_count).map_err(|_| error_unsufficent_size())? {
         return Err(OperationError::service_error(
             "Invalid plain GraphLinks reindex length",
@@ -545,6 +654,22 @@ fn validate_plain_layout(
     {
         return Err(OperationError::service_error(
             "Invalid plain GraphLinks level offsets length",
+        ));
+    }
+    if point_count == 0 {
+        if levels_count != 0 {
+            return Err(OperationError::service_error(
+                "Invalid plain GraphLinks level/point counts",
+            ));
+        }
+    } else if levels_count == 0 {
+        return Err(OperationError::service_error(
+            "Invalid plain GraphLinks level/point counts",
+        ));
+    }
+    if header.total_offset_count < header.point_count.saturating_add(1) {
+        return Err(OperationError::service_error(
+            "Invalid plain GraphLinks total offset count",
         ));
     }
     if offsets.is_empty() {
@@ -586,7 +711,6 @@ fn validate_plain_layout(
         ));
     }
 
-    let point_count = reindex.len();
     let mut seen = vec![false; point_count];
     for &value in reindex {
         let idx = value as usize;
@@ -605,18 +729,167 @@ fn validate_plain_layout(
     Ok(())
 }
 
-fn read_level_offsets(
+fn read_level_offsets_with_endian(
     bytes: &[u8],
     levels_count: u64,
     total_offset_count: u64,
+    endian: PlainEndian,
 ) -> OperationResult<(Vec<u64>, &[u8])> {
-    let (level_offsets, bytes) = get_slice::<u64>(bytes, levels_count)?;
+    let (level_offsets, bytes) = if endian_matches_host(endian) {
+        let (level_offsets, bytes) = get_slice::<u64>(bytes, levels_count)?;
+        (level_offsets.to_vec(), bytes)
+    } else {
+        decode_u64_slice(bytes, levels_count, endian)?
+    };
     let mut result = Vec::with_capacity(level_offsets.len() + 1);
-    result.extend_from_slice(level_offsets);
+    result.extend(level_offsets);
     result.push(total_offset_count.checked_sub(1).ok_or_else(|| {
         OperationError::service_error("Total offset count should be at least 1 in GraphLinks file")
     })?);
     Ok((result, bytes))
+}
+
+fn get_point_offsets_with_endian(
+    bytes: &[u8],
+    count: u64,
+    endian: PlainEndian,
+) -> OperationResult<(Cow<'_, [PointOffsetType]>, &[u8])> {
+    if endian_matches_host(endian) {
+        let (reindex, bytes) = get_slice::<PointOffsetType>(bytes, count)?;
+        Ok((Cow::Borrowed(reindex), bytes))
+    } else {
+        let (reindex, bytes) = decode_u32_slice(bytes, count, endian)?;
+        Ok((Cow::Owned(reindex), bytes))
+    }
+}
+
+fn validate_compressed_layout(
+    level_offsets: &[u64],
+    reindex: &[PointOffsetType],
+    levels_count: u64,
+    point_count: u64,
+    total_offset_count: u64,
+) -> OperationResult<()> {
+    let point_count = usize::try_from(point_count).map_err(|_| error_unsufficent_size())?;
+    let levels_count = usize::try_from(levels_count).map_err(|_| error_unsufficent_size())?;
+
+    if reindex.len() != point_count {
+        return Err(OperationError::service_error(
+            "Invalid compressed GraphLinks reindex length",
+        ));
+    }
+    if level_offsets.len() != levels_count + 1 {
+        return Err(OperationError::service_error(
+            "Invalid compressed GraphLinks level offsets length",
+        ));
+    }
+    if point_count == 0 {
+        if levels_count != 0 {
+            return Err(OperationError::service_error(
+                "Invalid compressed GraphLinks level/point counts",
+            ));
+        }
+    } else if levels_count == 0 {
+        return Err(OperationError::service_error(
+            "Invalid compressed GraphLinks level/point counts",
+        ));
+    }
+    if total_offset_count < point_count as u64 + 1 {
+        return Err(OperationError::service_error(
+            "Invalid compressed GraphLinks total offset count",
+        ));
+    }
+    if total_offset_count == 0 {
+        return Err(OperationError::service_error(
+            "Total offset count should be at least 1 in GraphLinks file",
+        ));
+    }
+    if level_offsets.first() != Some(&0) {
+        return Err(OperationError::service_error(
+            "Invalid compressed GraphLinks level offsets: first offset must be zero",
+        ));
+    }
+    if level_offsets.windows(2).any(|window| window[0] > window[1]) {
+        return Err(OperationError::service_error(
+            "Invalid compressed GraphLinks level offsets: must be non-decreasing",
+        ));
+    }
+    if level_offsets
+        .last()
+        .is_some_and(|&offset| offset > total_offset_count - 1)
+    {
+        return Err(OperationError::service_error(
+            "Invalid compressed GraphLinks level offsets: out of bounds",
+        ));
+    }
+
+    let mut seen = vec![false; reindex.len()];
+    for &value in reindex {
+        let idx = value as usize;
+        if idx >= seen.len() {
+            return Err(OperationError::service_error(
+                "Invalid compressed GraphLinks reindex value",
+            ));
+        }
+        if seen[idx] {
+            return Err(OperationError::service_error(
+                "Invalid compressed GraphLinks reindex permutation",
+            ));
+        }
+        seen[idx] = true;
+    }
+    Ok(())
+}
+
+fn validate_compressed_offsets_reader(
+    offsets: &bitpacking_ordered::Reader<'_>,
+    total_offset_count: u64,
+    total_neighbors_bytes: u64,
+    kind: &str,
+) -> OperationResult<()> {
+    let total_offset_count =
+        usize::try_from(total_offset_count).map_err(|_| error_unsufficent_size())?;
+    if total_offset_count == 0 {
+        return Err(OperationError::service_error(
+            "Total offset count should be at least 1 in GraphLinks file",
+        ));
+    }
+
+    let first = offsets.get(0).ok_or_else(error_unsufficent_size)?;
+    if first != 0 {
+        return Err(OperationError::service_error(format!(
+            "Invalid {kind} GraphLinks offsets: first offset must be zero"
+        )));
+    }
+
+    let mut previous = first;
+    for idx in 1..total_offset_count {
+        let current = offsets.get(idx).ok_or_else(error_unsufficent_size)?;
+        if current < previous {
+            return Err(OperationError::service_error(format!(
+                "Invalid {kind} GraphLinks offsets: must be non-decreasing"
+            )));
+        }
+        if current > total_neighbors_bytes {
+            return Err(OperationError::service_error(format!(
+                "Invalid {kind} GraphLinks offsets: out of bounds"
+            )));
+        }
+        previous = current;
+    }
+
+    if previous != total_neighbors_bytes {
+        return Err(OperationError::service_error(format!(
+            "Invalid {kind} GraphLinks offsets: last offset mismatch"
+        )));
+    }
+
+    Ok(())
+}
+
+fn endian_matches_host(endian: PlainEndian) -> bool {
+    (cfg!(target_endian = "little") && matches!(endian, PlainEndian::Little))
+        || (cfg!(target_endian = "big") && matches!(endian, PlainEndian::Big))
 }
 
 fn get_slice<T: FromBytes + Immutable>(data: &[u8], length: u64) -> OperationResult<(&[T], &[u8])> {
