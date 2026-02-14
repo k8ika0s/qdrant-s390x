@@ -8,6 +8,7 @@ mod chunked_mmap_vectors;
 pub mod chunked_vectors;
 pub mod common;
 pub mod dense;
+mod mmap_endian;
 pub mod multi_dense;
 pub mod quantized;
 pub mod query;

@@ -21,6 +21,7 @@ use crate::data_types::vectors::{VectorElementType, VectorRef};
 use crate::types::{Distance, VectorStorageDatatype};
 use crate::vector_storage::common::get_async_scorer;
 use crate::vector_storage::dense::mmap_dense_vectors::MmapDenseVectors;
+use crate::vector_storage::mmap_endian::MmapEndianConvertible;
 use crate::vector_storage::{AccessPattern, DenseVectorStorage, VectorStorage, VectorStorageEnum};
 
 const VECTORS_PATH: &str = "matrix.dat";
@@ -33,14 +34,14 @@ const DELETED_PATH: &str = "deleted.dat";
 ///
 /// Mem-mapped storage can only be constructed from another storage
 #[derive(Debug)]
-pub struct MemmapDenseVectorStorage<T: PrimitiveVectorElement> {
+pub struct MemmapDenseVectorStorage<T: PrimitiveVectorElement + MmapEndianConvertible> {
     vectors_path: PathBuf,
     deleted_path: PathBuf,
     mmap_store: Option<MmapDenseVectors<T>>,
     distance: Distance,
 }
 
-impl<T: PrimitiveVectorElement> MemmapDenseVectorStorage<T> {
+impl<T: PrimitiveVectorElement + MmapEndianConvertible> MemmapDenseVectorStorage<T> {
     /// Populate all pages in the mmap.
     /// Block until all pages are populated.
     pub fn populate(&self) {
@@ -130,7 +131,9 @@ pub fn open_memmap_vector_storage_with_async_io(
     Ok(VectorStorageEnum::DenseMemmap(storage))
 }
 
-fn open_memmap_vector_storage_with_async_io_impl<T: PrimitiveVectorElement>(
+fn open_memmap_vector_storage_with_async_io_impl<
+    T: PrimitiveVectorElement + MmapEndianConvertible,
+>(
     path: &Path,
     dim: usize,
     distance: Distance,
@@ -159,7 +162,7 @@ fn open_memmap_vector_storage_with_async_io_impl<T: PrimitiveVectorElement>(
     }))
 }
 
-impl<T: PrimitiveVectorElement> MemmapDenseVectorStorage<T> {
+impl<T: PrimitiveVectorElement + MmapEndianConvertible> MemmapDenseVectorStorage<T> {
     pub fn get_mmap_vectors(&self) -> &MmapDenseVectors<T> {
         self.mmap_store.as_ref().unwrap()
     }
@@ -172,7 +175,9 @@ impl<T: PrimitiveVectorElement> MemmapDenseVectorStorage<T> {
     }
 }
 
-impl<T: PrimitiveVectorElement> DenseVectorStorage<T> for MemmapDenseVectorStorage<T> {
+impl<T: PrimitiveVectorElement + MmapEndianConvertible> DenseVectorStorage<T>
+    for MemmapDenseVectorStorage<T>
+{
     fn vector_dim(&self) -> usize {
         self.mmap_store.as_ref().unwrap().dim
     }
@@ -191,7 +196,9 @@ impl<T: PrimitiveVectorElement> DenseVectorStorage<T> for MemmapDenseVectorStora
     }
 }
 
-impl<T: PrimitiveVectorElement> VectorStorage for MemmapDenseVectorStorage<T> {
+impl<T: PrimitiveVectorElement + MmapEndianConvertible> VectorStorage
+    for MemmapDenseVectorStorage<T>
+{
     fn distance(&self) -> Distance {
         self.distance
     }
@@ -271,10 +278,7 @@ impl<T: PrimitiveVectorElement> VectorStorage for MemmapDenseVectorStorage<T> {
         for (offset, (other_vector, other_deleted)) in other_vectors.enumerate() {
             check_process_stopped(stopped)?;
             let vector = T::slice_from_float_cow(Cow::try_from(other_vector)?);
-            // Safety: T implements zerocopy::IntoBytes.
-            #[expect(deprecated, reason = "legacy code")]
-            let raw_bites = unsafe { mmap_ops::transmute_to_u8_slice(vector.as_ref()) };
-            vectors_file.write_all(raw_bites)?;
+            write_vector_le(&mut vectors_file, vector.as_ref())?;
             end_index += 1;
 
             // Remember deleted IDs so we can propagate deletions later
@@ -357,6 +361,25 @@ fn open_append<P: AsRef<Path>>(path: P) -> io::Result<File> {
     OpenOptions::new().append(true).open(path)
 }
 
+fn write_vector_le<T: PrimitiveVectorElement + MmapEndianConvertible>(
+    writer: &mut impl Write,
+    vector: &[T],
+) -> io::Result<()> {
+    if cfg!(target_endian = "little") {
+        // Safety: `T` implements zerocopy::IntoBytes.
+        #[expect(deprecated, reason = "legacy code")]
+        let raw_bytes = unsafe { mmap_ops::transmute_to_u8_slice(vector) };
+        writer.write_all(raw_bytes)
+    } else {
+        let mut encoded = Vec::with_capacity(vector.len());
+        encoded.extend(vector.iter().map(|value| value.to_le_storage()));
+        // Safety: `T` implements zerocopy::IntoBytes.
+        #[expect(deprecated, reason = "legacy code")]
+        let raw_bytes = unsafe { mmap_ops::transmute_to_u8_slice(encoded.as_slice()) };
+        writer.write_all(raw_bytes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::mem::transmute;
@@ -380,6 +403,14 @@ mod tests {
         QuantizedVectors, QuantizedVectorsStorageType,
     };
     use crate::vector_storage::{DEFAULT_STOPPED, Random, new_raw_scorer};
+
+    #[test]
+    fn test_write_vector_le_persists_little_endian_payload() {
+        let mut out = Vec::new();
+        write_vector_le(&mut out, &[1.0f32, -2.5f32]).unwrap();
+        assert_eq!(&out[..4], &1.0f32.to_le_bytes());
+        assert_eq!(&out[4..8], &(-2.5f32).to_le_bytes());
+    }
 
     #[test]
     fn test_basic_persistence() {

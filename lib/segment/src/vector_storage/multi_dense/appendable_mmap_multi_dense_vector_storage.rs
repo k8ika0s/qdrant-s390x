@@ -21,6 +21,7 @@ use crate::vector_storage::dense::appendable_dense_vector_storage::{
     open_appendable_memmap_vector_storage_byte, open_appendable_memmap_vector_storage_full,
     open_appendable_memmap_vector_storage_half,
 };
+use crate::vector_storage::mmap_endian::MmapEndianConvertible;
 use crate::vector_storage::{
     AccessPattern, MultiVectorStorage, Random, Sequential, VectorOffsetType, VectorStorage,
     VectorStorageEnum,
@@ -38,8 +39,29 @@ pub struct MultivectorMmapOffset {
     capacity: u32,
 }
 
+impl MmapEndianConvertible for MultivectorMmapOffset {
+    #[inline]
+    fn to_le_storage(self) -> Self {
+        Self {
+            offset: self.offset.to_le(),
+            count: self.count.to_le(),
+            capacity: self.capacity.to_le(),
+        }
+    }
+
+    #[inline]
+    fn from_le_storage(stored: Self) -> Self {
+        Self {
+            offset: u32::from_le(stored.offset),
+            count: u32::from_le(stored.count),
+            capacity: u32::from_le(stored.capacity),
+        }
+    }
+}
+
 #[derive(Debug)]
-pub struct AppendableMmapMultiDenseVectorStorage<T: PrimitiveVectorElement> {
+pub struct AppendableMmapMultiDenseVectorStorage<T: PrimitiveVectorElement + MmapEndianConvertible>
+{
     vectors: ChunkedMmapVectors<T>,
     offsets: ChunkedMmapVectors<MultivectorMmapOffset>,
     /// Flags marking deleted vectors
@@ -53,7 +75,7 @@ pub struct AppendableMmapMultiDenseVectorStorage<T: PrimitiveVectorElement> {
     _phantom: std::marker::PhantomData<T>,
 }
 
-impl<T: PrimitiveVectorElement> AppendableMmapMultiDenseVectorStorage<T> {
+impl<T: PrimitiveVectorElement + MmapEndianConvertible> AppendableMmapMultiDenseVectorStorage<T> {
     /// Set deleted flag for given key. Returns previous deleted state.
     #[inline]
     fn set_deleted(&mut self, key: PointOffsetType, deleted: bool) -> bool {
@@ -91,7 +113,9 @@ impl<T: PrimitiveVectorElement> AppendableMmapMultiDenseVectorStorage<T> {
     }
 }
 
-impl<T: PrimitiveVectorElement> MultiVectorStorage<T> for AppendableMmapMultiDenseVectorStorage<T> {
+impl<T: PrimitiveVectorElement + MmapEndianConvertible> MultiVectorStorage<T>
+    for AppendableMmapMultiDenseVectorStorage<T>
+{
     fn vector_dim(&self) -> usize {
         self.vectors.dim()
     }
@@ -152,7 +176,9 @@ impl<T: PrimitiveVectorElement> MultiVectorStorage<T> for AppendableMmapMultiDen
     }
 }
 
-impl<T: PrimitiveVectorElement> VectorStorage for AppendableMmapMultiDenseVectorStorage<T> {
+impl<T: PrimitiveVectorElement + MmapEndianConvertible> VectorStorage
+    for AppendableMmapMultiDenseVectorStorage<T>
+{
     fn distance(&self) -> Distance {
         self.distance
     }
@@ -436,7 +462,9 @@ pub fn open_appendable_memmap_multi_vector_storage_half(
     )))
 }
 
-pub fn open_appendable_memmap_multi_vector_storage_impl<T: PrimitiveVectorElement>(
+pub fn open_appendable_memmap_multi_vector_storage_impl<
+    T: PrimitiveVectorElement + MmapEndianConvertible,
+>(
     path: &Path,
     dim: usize,
     distance: Distance,

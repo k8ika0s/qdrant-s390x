@@ -8,7 +8,7 @@ use common::maybe_uninit::maybe_uninit_fill_from;
 use fs_err as fs;
 use fs_err::File;
 use io::file_operations::atomic_save_json;
-use memory::chunked_utils::{chunk_name, create_chunk, read_mmaps, UniversalMmapChunk};
+use memory::chunked_utils::{UniversalMmapChunk, chunk_name, create_chunk, read_mmaps};
 use memory::fadvise::clear_disk_cache;
 use memory::madvise::{Advice, AdviceSetting};
 use memory::mmap_ops::{create_and_ensure_length, open_write_mmap};
@@ -16,9 +16,10 @@ use memory::mmap_type::{MmapFlusher, MmapType};
 use num_traits::AsPrimitive;
 use serde::{Deserialize, Serialize};
 
-use crate::common::operation_error::{OperationError, OperationResult};
 use crate::common::Flusher;
+use crate::common::operation_error::{OperationError, OperationResult};
 use crate::vector_storage::common::{CHUNK_SIZE, PAGE_SIZE_BYTES, VECTOR_READ_BATCH_SIZE};
+use crate::vector_storage::mmap_endian::MmapEndianConvertible;
 use crate::vector_storage::query_scorer::is_read_with_prefetch_efficient;
 use crate::vector_storage::{AccessPattern, VectorOffset, VectorOffsetType};
 
@@ -193,10 +194,11 @@ pub struct ChunkedMmapVectors<T: Sized + 'static> {
     config: ChunkedMmapConfig,
     status: StatusFile,
     chunks: Vec<UniversalMmapChunk<T>>,
+    decoded_chunks: Option<Vec<Vec<T>>>,
     directory: PathBuf,
 }
 
-impl<T: Sized + Copy + 'static> ChunkedMmapVectors<T> {
+impl<T: Sized + Copy + MmapEndianConvertible + 'static> ChunkedMmapVectors<T> {
     fn config_file(directory: &Path) -> PathBuf {
         directory.join(CONFIG_FILE_NAME)
     }
@@ -279,13 +281,48 @@ impl<T: Sized + Copy + 'static> ChunkedMmapVectors<T> {
                 )
             })?;
         let status = StatusFile::open(directory, max_vectors)?;
+        let decoded_chunks = if cfg!(target_endian = "big") {
+            Some(
+                chunks
+                    .iter()
+                    .map(|chunk| Self::decode_chunk_values(chunk.as_slice()))
+                    .collect(),
+            )
+        } else {
+            None
+        };
         let vectors = Self {
             status,
             config,
             chunks,
+            decoded_chunks,
             directory: directory.to_owned(),
         };
         Ok(vectors)
+    }
+
+    #[inline]
+    fn decode_chunk_values(values: &[T]) -> Vec<T> {
+        if cfg!(target_endian = "little") {
+            values.to_vec()
+        } else {
+            values
+                .iter()
+                .map(|value| T::from_le_storage(*value))
+                .collect()
+        }
+    }
+
+    #[inline]
+    fn encode_chunk_values(values: &[T], out: &mut [T]) {
+        debug_assert_eq!(values.len(), out.len());
+        if cfg!(target_endian = "little") {
+            out.copy_from_slice(values);
+        } else {
+            for (value, out) in values.iter().zip(out.iter_mut()) {
+                *out = value.to_le_storage();
+            }
+        }
     }
 
     #[inline]
@@ -321,8 +358,18 @@ impl<T: Sized + Copy + 'static> ChunkedMmapVectors<T> {
             self.chunks.len(),
             self.config.chunk_size_bytes,
         )?;
+        let decoded_chunk = if cfg!(target_endian = "big") {
+            Some(Self::decode_chunk_values(chunk.as_slice()))
+        } else {
+            None
+        };
 
         self.chunks.push(chunk);
+        if let (Some(decoded_chunks), Some(decoded_chunk)) =
+            (&mut self.decoded_chunks, decoded_chunk)
+        {
+            decoded_chunks.push(decoded_chunk);
+        }
         Ok(())
     }
 
@@ -366,8 +413,11 @@ impl<T: Sized + Copy + 'static> ChunkedMmapVectors<T> {
         }
 
         let chunk = &mut self.chunks[chunk_idx];
-
-        chunk.as_mut_slice()[chunk_offset..chunk_offset + vectors.len()].copy_from_slice(vectors);
+        let write_range = chunk_offset..chunk_offset + vectors.len();
+        Self::encode_chunk_values(vectors, &mut chunk.as_mut_slice()[write_range.clone()]);
+        if let Some(decoded_chunks) = &mut self.decoded_chunks {
+            decoded_chunks[chunk_idx][write_range].copy_from_slice(vectors);
+        }
 
         hw_counter
             .vector_io_write_counter()
@@ -415,12 +465,16 @@ impl<T: Sized + Copy + 'static> ChunkedMmapVectors<T> {
         let block_size_elements = count * self.config.dim;
         let chunk_offset = self.get_chunk_offset(start_key);
         let chunk_end = chunk_offset + block_size_elements;
-        let chunk = &self.chunks[chunk_idx];
-        if chunk_end > chunk.len() {
+        let chunk_len = self.chunks[chunk_idx].len();
+        if chunk_end > chunk_len {
             None
+        } else if let Some(decoded_chunks) = &self.decoded_chunks {
+            Some(&decoded_chunks[chunk_idx][chunk_offset..chunk_end])
         } else if force_sequential || block_size_elements * size_of::<T>() > PAGE_SIZE_BYTES * 4 {
+            let chunk = &self.chunks[chunk_idx];
             Some(&chunk.as_seq_slice()[chunk_offset..chunk_end])
         } else {
+            let chunk = &self.chunks[chunk_idx];
             Some(&chunk.as_slice()[chunk_offset..chunk_end])
         }
     }
@@ -510,8 +564,8 @@ mod tests {
     use std::iter::zip;
 
     use fs_err as fs;
-    use rand::prelude::StdRng;
     use rand::SeedableRng;
+    use rand::prelude::StdRng;
     use tempfile::Builder;
 
     use super::*;
@@ -653,5 +707,26 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("Invalid chunked mmap status len"));
+    }
+
+    #[test]
+    fn test_chunked_mmap_vector_payload_is_little_endian() {
+        let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
+        let dim = 2;
+        let hw_counter = HardwareCounterCell::new();
+
+        let mut storage: ChunkedMmapVectors<VectorElementType> =
+            ChunkedMmapVectors::open(dir.path(), dim, AdviceSetting::Global, Some(true)).unwrap();
+        storage.push(&[1.0, -2.5], &hw_counter).unwrap();
+        storage.flusher()().unwrap();
+
+        let chunk_path = chunk_name(dir.path(), 0);
+        let raw = fs::read(chunk_path).unwrap();
+        assert!(raw.len() >= 8);
+        assert_eq!(&raw[..4], &1.0f32.to_le_bytes());
+        assert_eq!(&raw[4..8], &(-2.5f32).to_le_bytes());
+
+        let loaded = storage.get::<crate::vector_storage::Random>(0).unwrap();
+        assert_eq!(loaded, &[1.0, -2.5]);
     }
 }

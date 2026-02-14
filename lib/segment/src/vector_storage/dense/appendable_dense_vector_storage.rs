@@ -18,6 +18,7 @@ use crate::data_types::primitive::PrimitiveVectorElement;
 use crate::data_types::vectors::{VectorElementType, VectorRef};
 use crate::types::{Distance, VectorStorageDatatype};
 use crate::vector_storage::chunked_mmap_vectors::ChunkedMmapVectors;
+use crate::vector_storage::mmap_endian::MmapEndianConvertible;
 use crate::vector_storage::{
     AccessPattern, DenseVectorStorage, VectorOffsetType, VectorStorage, VectorStorageEnum,
 };
@@ -26,7 +27,7 @@ const VECTORS_DIR_PATH: &str = "vectors";
 const DELETED_DIR_PATH: &str = "deleted";
 
 #[derive(Debug)]
-pub struct AppendableMmapDenseVectorStorage<T: PrimitiveVectorElement> {
+pub struct AppendableMmapDenseVectorStorage<T: PrimitiveVectorElement + MmapEndianConvertible> {
     vectors: ChunkedMmapVectors<T>,
     /// Flags marking deleted vectors
     ///
@@ -38,7 +39,7 @@ pub struct AppendableMmapDenseVectorStorage<T: PrimitiveVectorElement> {
     _phantom: std::marker::PhantomData<T>,
 }
 
-impl<T: PrimitiveVectorElement> AppendableMmapDenseVectorStorage<T> {
+impl<T: PrimitiveVectorElement + MmapEndianConvertible> AppendableMmapDenseVectorStorage<T> {
     /// Set deleted flag for given key. Returns previous deleted state.
     #[inline]
     fn set_deleted(&mut self, key: PointOffsetType, deleted: bool) -> bool {
@@ -75,7 +76,9 @@ impl<T: PrimitiveVectorElement> AppendableMmapDenseVectorStorage<T> {
     }
 }
 
-impl<T: PrimitiveVectorElement> DenseVectorStorage<T> for AppendableMmapDenseVectorStorage<T> {
+impl<T: PrimitiveVectorElement + MmapEndianConvertible> DenseVectorStorage<T>
+    for AppendableMmapDenseVectorStorage<T>
+{
     fn vector_dim(&self) -> usize {
         self.vectors.dim()
     }
@@ -91,7 +94,9 @@ impl<T: PrimitiveVectorElement> DenseVectorStorage<T> for AppendableMmapDenseVec
     }
 }
 
-impl<T: PrimitiveVectorElement> VectorStorage for AppendableMmapDenseVectorStorage<T> {
+impl<T: PrimitiveVectorElement + MmapEndianConvertible> VectorStorage
+    for AppendableMmapDenseVectorStorage<T>
+{
     fn distance(&self) -> Distance {
         self.distance
     }
@@ -236,7 +241,9 @@ pub fn open_appendable_memmap_vector_storage_half(
     )))
 }
 
-pub fn open_appendable_memmap_vector_storage_impl<T: PrimitiveVectorElement>(
+pub fn open_appendable_memmap_vector_storage_impl<
+    T: PrimitiveVectorElement + MmapEndianConvertible,
+>(
     path: &Path,
     dim: usize,
     distance: Distance,
