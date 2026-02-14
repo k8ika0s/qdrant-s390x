@@ -49,6 +49,7 @@ pub struct InvertedIndexFileHeader {
 pub struct InvertedIndexMmap {
     path: PathBuf,
     mmap: Arc<Mmap>,
+    decoded_postings: Option<Vec<Vec<PostingElementEx>>>,
     pub file_header: InvertedIndexFileHeader,
 }
 
@@ -173,6 +174,11 @@ impl InvertedIndexMmap {
         if *id >= self.file_header.posting_count as DimId {
             return None;
         }
+
+        if let Some(decoded_postings) = &self.decoded_postings {
+            return decoded_postings.get(*id as usize).map(Vec::as_slice);
+        }
+
         let header_start = *id as usize * POSTING_HEADER_SIZE;
         // Safety: memory has correct size and alignment for the type.
         #[expect(deprecated, reason = "legacy code")]
@@ -228,6 +234,17 @@ impl InvertedIndexMmap {
         Ok(Self {
             path: path.as_ref().to_owned(),
             mmap: Arc::new(mmap.make_read_only()?),
+            decoded_postings: if cfg!(target_endian = "big") {
+                Some(
+                    inverted_index_ram
+                        .postings
+                        .iter()
+                        .map(|posting| posting.elements.clone())
+                        .collect(),
+                )
+            } else {
+                None
+            },
             file_header,
         })
     }
@@ -244,11 +261,131 @@ impl InvertedIndexMmap {
             AdviceSetting::from(Advice::Normal),
             false,
         )?;
+        let decoded_postings = if cfg!(target_endian = "big") {
+            Some(Self::decode_postings_le(
+                mmap.as_ref(),
+                file_header.posting_count,
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
             path: path.as_ref().to_owned(),
             mmap: Arc::new(mmap),
+            decoded_postings,
             file_header,
         })
+    }
+
+    fn invalid_data(message: impl Into<String>) -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, message.into())
+    }
+
+    fn decode_posting_header_le(bytes: &[u8]) -> std::io::Result<PostingListFileHeader> {
+        if bytes.len() != POSTING_HEADER_SIZE {
+            return Err(Self::invalid_data("invalid sparse posting header size"));
+        }
+        let start_offset = u64::from_le_bytes(
+            bytes[0..8]
+                .try_into()
+                .expect("posting header start_offset size is fixed"),
+        );
+        let end_offset = u64::from_le_bytes(
+            bytes[8..16]
+                .try_into()
+                .expect("posting header end_offset size is fixed"),
+        );
+        Ok(PostingListFileHeader {
+            start_offset,
+            end_offset,
+        })
+    }
+
+    fn decode_posting_element_le(bytes: &[u8]) -> std::io::Result<PostingElementEx> {
+        let element_size = size_of::<PostingElementEx>();
+        if bytes.len() != element_size {
+            return Err(Self::invalid_data("invalid sparse posting element size"));
+        }
+        if element_size < 12 {
+            return Err(Self::invalid_data("invalid sparse posting element layout"));
+        }
+
+        let record_id = u32::from_le_bytes(
+            bytes[0..4]
+                .try_into()
+                .expect("posting element record_id size is fixed"),
+        );
+        let weight = f32::from_le_bytes(
+            bytes[4..8]
+                .try_into()
+                .expect("posting element weight size is fixed"),
+        );
+        let max_next_weight = f32::from_le_bytes(
+            bytes[8..12]
+                .try_into()
+                .expect("posting element max_next_weight size is fixed"),
+        );
+        Ok(PostingElementEx {
+            record_id,
+            weight,
+            max_next_weight,
+        })
+    }
+
+    fn decode_postings_le(
+        data: &[u8],
+        posting_count: usize,
+    ) -> std::io::Result<Vec<Vec<PostingElementEx>>> {
+        let headers_size = posting_count
+            .checked_mul(POSTING_HEADER_SIZE)
+            .ok_or_else(|| Self::invalid_data("sparse posting header size overflow"))?;
+        if headers_size > data.len() {
+            return Err(Self::invalid_data(
+                "sparse posting headers exceed file length",
+            ));
+        }
+
+        let mut headers = Vec::with_capacity(posting_count);
+        for i in 0..posting_count {
+            let start = i * POSTING_HEADER_SIZE;
+            let end = start + POSTING_HEADER_SIZE;
+            headers.push(Self::decode_posting_header_le(&data[start..end])?);
+        }
+
+        let element_size = size_of::<PostingElementEx>();
+        let mut postings = Vec::with_capacity(posting_count);
+        for (i, header) in headers.iter().enumerate() {
+            let start_offset = usize::try_from(header.start_offset).map_err(|_| {
+                Self::invalid_data("start_offset does not fit target address space")
+            })?;
+            let end_offset = usize::try_from(header.end_offset)
+                .map_err(|_| Self::invalid_data("end_offset does not fit target address space"))?;
+            let next_start = if i + 1 < headers.len() {
+                usize::try_from(headers[i + 1].start_offset).map_err(|_| {
+                    Self::invalid_data("next start_offset does not fit target address space")
+                })?
+            } else {
+                data.len()
+            };
+
+            if !(start_offset <= end_offset && end_offset <= next_start && next_start <= data.len())
+            {
+                return Err(Self::invalid_data("invalid sparse posting boundaries"));
+            }
+
+            let posting_bytes = &data[start_offset..end_offset];
+            if !posting_bytes.len().is_multiple_of(element_size) {
+                return Err(Self::invalid_data("invalid sparse posting bytes alignment"));
+            }
+
+            let mut posting = Vec::with_capacity(posting_bytes.len() / element_size);
+            for element_bytes in posting_bytes.chunks_exact(element_size) {
+                posting.push(Self::decode_posting_element_le(element_bytes)?);
+            }
+            postings.push(posting);
+        }
+
+        Ok(postings)
     }
 
     fn total_posting_headers_size(inverted_index_ram: &InvertedIndexRam) -> usize {
@@ -270,12 +407,23 @@ impl InvertedIndexMmap {
             elements_offset = posting_header.end_offset as usize;
 
             // save posting header
-            // Safety: posting_header is a POD type.
-            #[expect(deprecated, reason = "legacy code")]
-            let posting_header_bytes = unsafe { transmute_to_u8(&posting_header) };
             let start_posting_offset = id * POSTING_HEADER_SIZE;
             let end_posting_offset = (id + 1) * POSTING_HEADER_SIZE;
-            mmap[start_posting_offset..end_posting_offset].copy_from_slice(posting_header_bytes);
+            if cfg!(target_endian = "big") {
+                let mut posting_header_bytes = [0u8; POSTING_HEADER_SIZE];
+                posting_header_bytes[0..8]
+                    .copy_from_slice(&posting_header.start_offset.to_le_bytes());
+                posting_header_bytes[8..16]
+                    .copy_from_slice(&posting_header.end_offset.to_le_bytes());
+                mmap[start_posting_offset..end_posting_offset]
+                    .copy_from_slice(&posting_header_bytes);
+            } else {
+                // Safety: posting_header is a POD type.
+                #[expect(deprecated, reason = "legacy code")]
+                let posting_header_bytes = unsafe { transmute_to_u8(&posting_header) };
+                mmap[start_posting_offset..end_posting_offset]
+                    .copy_from_slice(posting_header_bytes);
+            }
         }
     }
 
@@ -286,13 +434,25 @@ impl InvertedIndexMmap {
     ) {
         let mut offset = total_posting_headers_size;
         for posting in &inverted_index_ram.postings {
-            // save posting element
-            // Safety: `PostingElementEx` is a POD type.
-            #[expect(deprecated, reason = "legacy code")]
-            let posting_elements_bytes = unsafe { transmute_to_u8_slice(&posting.elements) };
-            mmap[offset..offset + posting_elements_bytes.len()]
-                .copy_from_slice(posting_elements_bytes);
-            offset += posting_elements_bytes.len();
+            if cfg!(target_endian = "big") {
+                let element_size = size_of::<PostingElementEx>();
+                for element in &posting.elements {
+                    let mut element_bytes = vec![0u8; element_size];
+                    element_bytes[0..4].copy_from_slice(&element.record_id.to_le_bytes());
+                    element_bytes[4..8].copy_from_slice(&element.weight.to_le_bytes());
+                    element_bytes[8..12].copy_from_slice(&element.max_next_weight.to_le_bytes());
+                    mmap[offset..offset + element_bytes.len()].copy_from_slice(&element_bytes);
+                    offset += element_bytes.len();
+                }
+            } else {
+                // save posting element
+                // Safety: `PostingElementEx` is a POD type.
+                #[expect(deprecated, reason = "legacy code")]
+                let posting_elements_bytes = unsafe { transmute_to_u8_slice(&posting.elements) };
+                mmap[offset..offset + posting_elements_bytes.len()]
+                    .copy_from_slice(posting_elements_bytes);
+                offset += posting_elements_bytes.len();
+            }
         }
     }
 
@@ -311,6 +471,7 @@ impl InvertedIndexMmap {
 
 #[cfg(test)]
 mod tests {
+    use fs_err as fs;
     use tempfile::Builder;
 
     use super::*;
@@ -327,6 +488,25 @@ mod tests {
             for i in 0..posting_list_ram.len() {
                 assert_eq!(posting_list_ram[i], posting_list_mmap[i]);
             }
+        }
+    }
+
+    fn compare_with_decoded_from_raw_file(
+        inverted_index_ram: &InvertedIndexRam,
+        path: &Path,
+        posting_count: usize,
+    ) {
+        let bytes = fs::read(InvertedIndexMmap::index_file_path(path)).unwrap();
+        let decoded = InvertedIndexMmap::decode_postings_le(&bytes, posting_count).unwrap();
+
+        assert_eq!(decoded.len(), posting_count);
+        for (id, posting_list_decoded) in decoded.iter().enumerate() {
+            let posting_list_ram = inverted_index_ram
+                .get(&(id as DimId))
+                .unwrap()
+                .elements
+                .as_slice();
+            assert_eq!(posting_list_decoded.as_slice(), posting_list_ram);
         }
     }
 
@@ -352,6 +532,11 @@ mod tests {
                 InvertedIndexMmap::convert_and_save(&inverted_index_ram, &tmp_dir_path).unwrap();
 
             compare_indexes(&inverted_index_ram, &inverted_index_mmap);
+            compare_with_decoded_from_raw_file(
+                &inverted_index_ram,
+                tmp_dir_path.path(),
+                inverted_index_mmap.file_header.posting_count,
+            );
         }
         let inverted_index_mmap = InvertedIndexMmap::load(&tmp_dir_path).unwrap();
         // posting_count: 0th entry is always empty + 1st + 2nd + 3rd + 4th empty + 5th

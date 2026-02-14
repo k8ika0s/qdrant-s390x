@@ -6,8 +6,7 @@ use std::path::Path;
 use fs_err::File;
 use memmap2::Mmap;
 use memory::madvise::{Advice, AdviceSetting};
-#[expect(deprecated, reason = "legacy code")]
-use memory::mmap_ops::{open_read_mmap, transmute_from_u8, transmute_from_u8_to_slice};
+use memory::mmap_ops::open_read_mmap;
 use validator::ValidationErrors;
 
 use crate::common::sparse_vector::SparseVector;
@@ -62,19 +61,31 @@ impl Csr {
     }
 
     fn from_mmap(mmap: Mmap) -> io::Result<Self> {
-        // Safety: CsrHeader is a POD type.
-        #[expect(deprecated, reason = "legacy code")]
-        let CsrHeader { nrow, ncol, nnz } =
-            unsafe { transmute_from_u8(&mmap.as_ref()[..CSR_HEADER_SIZE]) };
-        let (nrow, _ncol, nnz) = (*nrow as usize, *ncol as usize, *nnz as usize);
+        let bytes = mmap.as_ref();
+        if bytes.len() < CSR_HEADER_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "CSR file is too short for header",
+            ));
+        }
 
-        // Safety: correct alignment.
-        let indptr = Vec::from(unsafe {
-            #[expect(deprecated, reason = "legacy code")]
-            transmute_from_u8_to_slice::<u64>(
-                &mmap.as_ref()[CSR_HEADER_SIZE..CSR_HEADER_SIZE + size_of::<u64>() * (nrow + 1)],
-            )
-        });
+        let nrow = u64::from_le_bytes(bytes[0..8].try_into().expect("slice size checked")) as usize;
+        let _ncol = u64::from_le_bytes(bytes[8..16].try_into().expect("slice size checked"));
+        let nnz =
+            u64::from_le_bytes(bytes[16..24].try_into().expect("slice size checked")) as usize;
+
+        let indptr_end = CSR_HEADER_SIZE + size_of::<u64>() * (nrow + 1);
+        if bytes.len() < indptr_end {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "CSR file is too short for indptr",
+            ));
+        }
+
+        let indptr = bytes[CSR_HEADER_SIZE..indptr_end]
+            .chunks_exact(size_of::<u64>())
+            .map(|chunk| u64::from_le_bytes(chunk.try_into().expect("chunk size is fixed")))
+            .collect::<Vec<_>>();
         if !indptr.windows(2).all(|w| w[0] <= w[1]) || indptr.last() != Some(&(nnz as u64)) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -100,24 +111,31 @@ impl Csr {
             let start = *self.intptr.get_unchecked(row) as usize;
             let end = *self.intptr.get_unchecked(row + 1) as usize;
 
-            let mut pos = CSR_HEADER_SIZE + size_of::<u64>() * (self.nrow + 1);
+            let indices_offset = CSR_HEADER_SIZE + size_of::<u64>() * (self.nrow + 1);
+            let indices_start = indices_offset + size_of::<u32>() * start;
+            let indices_end = indices_offset + size_of::<u32>() * end;
 
-            #[expect(deprecated, reason = "legacy code")]
-            let indices = transmute_from_u8_to_slice::<u32>(
-                self.mmap
-                    .as_ref()
-                    .get_unchecked(pos + size_of::<u32>() * start..pos + size_of::<u32>() * end),
-            );
-            pos += size_of::<u32>() * self.nnz;
+            let data_offset = indices_offset + size_of::<u32>() * self.nnz;
+            let data_start = data_offset + size_of::<f32>() * start;
+            let data_end = data_offset + size_of::<f32>() * end;
 
-            #[expect(deprecated, reason = "legacy code")]
-            let data = transmute_from_u8_to_slice::<f32>(
-                self.mmap
-                    .as_ref()
-                    .get_unchecked(pos + size_of::<f32>() * start..pos + size_of::<f32>() * end),
-            );
+            let indices = self
+                .mmap
+                .as_ref()
+                .get_unchecked(indices_start..indices_end)
+                .chunks_exact(size_of::<u32>())
+                .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("chunk size is fixed")))
+                .collect::<Vec<_>>();
 
-            SparseVector::new(indices.to_vec(), data.to_vec())
+            let data = self
+                .mmap
+                .as_ref()
+                .get_unchecked(data_start..data_end)
+                .chunks_exact(size_of::<f32>())
+                .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("chunk size is fixed")))
+                .collect::<Vec<_>>();
+
+            SparseVector::new(indices, data)
         }
     }
 }
