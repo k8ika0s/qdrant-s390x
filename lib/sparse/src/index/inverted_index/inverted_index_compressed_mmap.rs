@@ -1056,4 +1056,69 @@ mod tests {
         assert!(inverted_index_mmap.get(7, &hw_counter).is_none());
         assert!(inverted_index_mmap.get(100, &hw_counter).is_none());
     }
+
+    #[test]
+    fn test_decode_postings_le_rejects_truncated_header() {
+        let mut builder = InvertedIndexBuilder::new();
+        builder.add(1, [(1, 10.0), (2, 20.0)].into());
+        let inverted_index_ram = builder.build();
+        let tmp_dir_path = Builder::new()
+            .prefix("test_index_dir_hdr")
+            .tempdir()
+            .unwrap();
+        let inverted_index_ram = InvertedIndexCompressedImmutableRam::from_ram_index(
+            Cow::Borrowed(&inverted_index_ram),
+            &tmp_dir_path,
+        )
+        .unwrap();
+
+        let inverted_index_mmap = InvertedIndexCompressedMmap::<f32>::convert_and_save(
+            &inverted_index_ram,
+            &tmp_dir_path,
+        )
+        .unwrap();
+        let posting_count = inverted_index_mmap.file_header.posting_count;
+        let mut bytes = fs::read(InvertedIndexCompressedMmap::<f32>::index_file_path(
+            tmp_dir_path.path(),
+        ))
+        .unwrap();
+        bytes.truncate(posting_count * InvertedIndexCompressedMmap::<f32>::HEADER_SIZE - 1);
+
+        assert!(
+            InvertedIndexCompressedMmap::<f32>::decode_postings_le(&bytes, posting_count).is_err()
+        );
+    }
+
+    #[test]
+    fn test_decode_postings_le_rejects_corrupt_offsets() {
+        let mut builder = InvertedIndexBuilder::new();
+        builder.add(1, [(1, 10.0), (2, 20.0)].into());
+        let inverted_index_ram = builder.build();
+        let tmp_dir_path = Builder::new()
+            .prefix("test_index_dir_off")
+            .tempdir()
+            .unwrap();
+        let inverted_index_ram = InvertedIndexCompressedImmutableRam::from_ram_index(
+            Cow::Borrowed(&inverted_index_ram),
+            &tmp_dir_path,
+        )
+        .unwrap();
+
+        let inverted_index_mmap = InvertedIndexCompressedMmap::<f32>::convert_and_save(
+            &inverted_index_ram,
+            &tmp_dir_path,
+        )
+        .unwrap();
+        let posting_count = inverted_index_mmap.file_header.posting_count;
+        let mut bytes = fs::read(InvertedIndexCompressedMmap::<f32>::index_file_path(
+            tmp_dir_path.path(),
+        ))
+        .unwrap();
+        let bogus_start = bytes.len() as u64 + 1024;
+        bytes[0..8].copy_from_slice(&bogus_start.to_le_bytes());
+
+        assert!(
+            InvertedIndexCompressedMmap::<f32>::decode_postings_le(&bytes, posting_count).is_err()
+        );
+    }
 }
