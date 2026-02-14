@@ -346,6 +346,9 @@ pub(super) fn normalize_links(m: usize, mut links: Vec<PointOffsetType>) -> Vec<
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+    use std::mem::size_of;
+
     use io::file_operations::atomic_save;
     use rand::Rng;
     use rstest::rstest;
@@ -490,6 +493,63 @@ mod tests {
 
         let cmp_links = GraphLinks::load_from_file(&links_file, true, format).unwrap();
         check_links(links, &cmp_links, &vectors);
+    }
+
+    #[test]
+    fn test_plain_serialization_has_little_endian_versioned_header() {
+        let hnsw_m = HnswM::new2(8);
+        let links = vec![vec![vec![1]], vec![vec![0]]];
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        serialize_graph_links(links, GraphLinksFormatParam::Plain, hnsw_m, &mut cursor).unwrap();
+        let bytes = cursor.into_inner();
+
+        let version_offset = 5 * size_of::<u64>();
+        let version = u64::from_le_bytes(
+            bytes[version_offset..version_offset + size_of::<u64>()]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(version, super::header::HEADER_VERSION_PLAIN);
+    }
+
+    #[test]
+    fn test_load_plain_legacy_big_endian_fixture() {
+        let path = Builder::new().prefix("graph_dir").tempdir().unwrap();
+        let links_file = path.path().join("legacy_plain_be_links.bin");
+        fs_err::write(&links_file, legacy_plain_big_endian_fixture()).unwrap();
+
+        let links = GraphLinks::load_from_file(&links_file, true, GraphLinksFormat::Plain).unwrap();
+
+        assert_eq!(links.format(), GraphLinksFormat::Plain);
+        assert_eq!(links.links(0, 0).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(links.links(1, 0).collect::<Vec<_>>(), vec![0]);
+    }
+
+    fn legacy_plain_big_endian_fixture() -> Vec<u8> {
+        let mut bytes = Vec::new();
+
+        // Legacy plain header (native-endian fields, no version marker).
+        bytes.extend_from_slice(&2_u64.to_be_bytes()); // point_count
+        bytes.extend_from_slice(&1_u64.to_be_bytes()); // levels_count
+        bytes.extend_from_slice(&2_u64.to_be_bytes()); // total_neighbors_count
+        bytes.extend_from_slice(&3_u64.to_be_bytes()); // total_offset_count
+        bytes.extend_from_slice(&0_u64.to_be_bytes()); // offsets_padding_bytes
+        bytes.extend_from_slice(&[0_u8; 24]); // legacy zero padding
+
+        // level_offsets
+        bytes.extend_from_slice(&0_u64.to_be_bytes());
+        // reindex
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes.extend_from_slice(&1_u32.to_be_bytes());
+        // neighbors
+        bytes.extend_from_slice(&1_u32.to_be_bytes());
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        // offsets
+        bytes.extend_from_slice(&0_u64.to_be_bytes());
+        bytes.extend_from_slice(&1_u64.to_be_bytes());
+        bytes.extend_from_slice(&2_u64.to_be_bytes());
+
+        bytes
     }
 
     #[rstest]

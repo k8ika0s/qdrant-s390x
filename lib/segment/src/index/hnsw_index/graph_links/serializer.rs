@@ -13,7 +13,9 @@ use zerocopy::IntoBytes as AsBytes;
 use zerocopy::little_endian::U64 as LittleU64;
 
 use super::GraphLinksFormatParam;
-use super::header::{HEADER_VERSION_COMPRESSED, HeaderCompressed, HeaderPlain};
+use super::header::{
+    HEADER_VERSION_COMPRESSED, HEADER_VERSION_PLAIN, HeaderCompressed, HeaderPlain,
+};
 use crate::common::operation_error::{OperationError, OperationResult};
 use crate::index::hnsw_index::HnswM;
 use crate::index::hnsw_index::graph_links::header::{
@@ -67,11 +69,15 @@ pub fn serialize_graph_links<W: Write + Seek>(
     })?;
 
     // 2. Write level offsets
-    let mut total_offsets_len = 0;
+    let mut total_offsets_len: u64 = 0;
     {
         let mut suffix_sum = point_count_by_level.iter().sum::<u64>();
         for &value in point_count_by_level.iter() {
-            writer.write_all(total_offsets_len.as_bytes())?;
+            if matches!(format_param, GraphLinksFormatParam::Plain) {
+                writer.write_all(&total_offsets_len.to_le_bytes())?;
+            } else {
+                writer.write_all(total_offsets_len.as_bytes())?;
+            }
             total_offsets_len += suffix_sum;
             suffix_sum -= value;
         }
@@ -84,7 +90,11 @@ pub fn serialize_graph_links<W: Write + Seek>(
         for i in 0..back_index.len() {
             reindex[back_index[i] as usize] = i as PointOffsetType;
         }
-        writer.write_all(reindex.as_bytes())?;
+        if matches!(format_param, GraphLinksFormatParam::Plain) {
+            write_u32_slice_le(writer, &reindex)?;
+        } else {
+            writer.write_all(reindex.as_bytes())?;
+        }
     }
 
     // 4. Write neighbors padding (if applicable)
@@ -113,7 +123,7 @@ pub fn serialize_graph_links<W: Write + Seek>(
             let mut raw_links = std::mem::take(&mut edges[id as usize][level]);
             match format_param {
                 GraphLinksFormatParam::Plain => {
-                    writer.write_all(raw_links.as_bytes())?;
+                    write_u32_slice_le(writer, &raw_links)?;
                     offset += raw_links.len();
                 }
                 GraphLinksFormatParam::Compressed => {
@@ -181,7 +191,7 @@ pub fn serialize_graph_links<W: Write + Seek>(
             let len = writer.stream_position()? as usize;
             let offsets_padding = len.next_multiple_of(size_of::<u64>()) - len;
             writer.write_zeros(offsets_padding)?;
-            writer.write_all(offsets.as_bytes())?;
+            write_u64_slice_le(writer, &offsets)?;
             (Some(offsets_padding), None)
         }
         GraphLinksFormatParam::Compressed | GraphLinksFormatParam::CompressedWithVectors(_) => {
@@ -196,12 +206,13 @@ pub fn serialize_graph_links<W: Write + Seek>(
     match format_param {
         GraphLinksFormatParam::Plain => {
             let header = HeaderPlain {
-                point_count: edges.len() as u64,
-                levels_count: levels_count as u64,
-                total_neighbors_count: offset as u64,
-                total_offset_count: offsets.len() as u64,
-                offsets_padding_bytes: offsets_padding.unwrap() as u64,
-                zero_padding: [0; 24],
+                point_count: LittleU64::new(edges.len() as u64),
+                levels_count: LittleU64::new(levels_count as u64),
+                total_neighbors_count: LittleU64::new(offset as u64),
+                total_offset_count: LittleU64::new(offsets.len() as u64),
+                offsets_padding_bytes: LittleU64::new(offsets_padding.unwrap() as u64),
+                version: LittleU64::new(HEADER_VERSION_PLAIN),
+                zero_padding: [0; 16],
             };
             writer.write_all(header.as_bytes())?;
         }
@@ -244,4 +255,16 @@ fn pack_layout(layout: &Layout) -> PackedVectorLayout {
         size: LittleU64::new(layout.size() as u64),
         alignment: u8::try_from(layout.align()).expect("Alignment must fit in u8"),
     }
+}
+
+fn write_u32_slice_le<W: Write>(writer: &mut W, values: &[u32]) -> std::io::Result<()> {
+    values
+        .iter()
+        .try_for_each(|value| writer.write_all(&value.to_le_bytes()))
+}
+
+fn write_u64_slice_le<W: Write>(writer: &mut W, values: &[u64]) -> std::io::Result<()> {
+    values
+        .iter()
+        .try_for_each(|value| writer.write_all(&value.to_le_bytes()))
 }

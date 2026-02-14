@@ -10,13 +10,15 @@ use crate::common::operation_error::{OperationError, OperationResult};
 #[derive(FromBytes, Immutable, IntoBytes, KnownLayout)]
 #[repr(C)]
 pub(super) struct HeaderPlain {
-    pub(super) point_count: u64,
-    pub(super) levels_count: u64,
-    pub(super) total_neighbors_count: u64,
-    pub(super) total_offset_count: u64,
+    pub(super) point_count: LittleU64,
+    pub(super) levels_count: LittleU64,
+    pub(super) total_neighbors_count: LittleU64,
+    pub(super) total_offset_count: LittleU64,
     /// Either 0 or 4.
-    pub(super) offsets_padding_bytes: u64,
-    pub(super) zero_padding: [u8; 24],
+    pub(super) offsets_padding_bytes: LittleU64,
+    /// Should be [`HEADER_VERSION_PLAIN`].
+    pub(super) version: LittleU64,
+    pub(super) zero_padding: [u8; 16],
 }
 
 /// File header for the compressed format.
@@ -51,6 +53,7 @@ pub(super) struct HeaderCompressedWithVectors {
     pub(super) zero_padding: [u8; 3], // for 8-byte alignment
 }
 
+pub(super) const HEADER_VERSION_PLAIN: u64 = 0xFFFF_FFFF_FFFF_FF00;
 pub(super) const HEADER_VERSION_COMPRESSED: u64 = 0xFFFF_FFFF_FFFF_FF01;
 pub(super) const HEADER_VERSION_COMPRESSED_WITH_VECTORS: u64 = 0xFFFF_FFFF_FFFF_FF02;
 
