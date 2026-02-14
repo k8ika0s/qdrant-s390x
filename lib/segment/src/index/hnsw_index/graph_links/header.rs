@@ -54,8 +54,10 @@ pub(super) struct HeaderCompressedWithVectors {
 }
 
 pub(super) const HEADER_VERSION_PLAIN: u64 = 0xFFFF_FFFF_FFFF_FF00;
-pub(super) const HEADER_VERSION_COMPRESSED: u64 = 0xFFFF_FFFF_FFFF_FF01;
-pub(super) const HEADER_VERSION_COMPRESSED_WITH_VECTORS: u64 = 0xFFFF_FFFF_FFFF_FF02;
+pub(super) const HEADER_VERSION_COMPRESSED_LEGACY: u64 = 0xFFFF_FFFF_FFFF_FF01;
+pub(super) const HEADER_VERSION_COMPRESSED_WITH_VECTORS_LEGACY: u64 = 0xFFFF_FFFF_FFFF_FF02;
+pub(super) const HEADER_VERSION_COMPRESSED: u64 = 0xFFFF_FFFF_FFFF_FF03;
+pub(super) const HEADER_VERSION_COMPRESSED_WITH_VECTORS: u64 = 0xFFFF_FFFF_FFFF_FF04;
 
 /// Packed representation of [`Layout`].
 #[derive(Copy, Clone, FromBytes, Immutable, IntoBytes, KnownLayout)]
