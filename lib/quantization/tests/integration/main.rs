@@ -1,6 +1,8 @@
 #[cfg(test)]
 pub mod empty_storage;
 #[cfg(test)]
+pub mod endian;
+#[cfg(test)]
 pub mod metrics;
 #[cfg(test)]
 pub mod stop_condition;

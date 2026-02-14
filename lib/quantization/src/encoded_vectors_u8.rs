@@ -234,7 +234,9 @@ impl<TStorage: EncodedStorage> EncodedVectorsU8<TStorage> {
             }
 
             let mut encoded_vector = Vec::with_capacity(actual_dim + ADDITIONAL_CONSTANT_SIZE);
-            encoded_vector.extend_from_slice(&f32::default().to_ne_bytes());
+            // Persist the per-vector constant in canonical little-endian so segments can be moved
+            // across endianness.
+            encoded_vector.extend_from_slice(&f32::default().to_le_bytes());
             for &value in vector.as_ref() {
                 let encoded = metadata.encode_value(value);
                 encoded_vector.push(encoded);
@@ -271,7 +273,7 @@ impl<TStorage: EncodedStorage> EncodedVectorsU8<TStorage> {
             // apply `a^2` shift
             let vector_offset = metadata.get_shift() + vector_offset;
             encoded_vector[0..ADDITIONAL_CONSTANT_SIZE]
-                .copy_from_slice(&vector_offset.to_ne_bytes());
+                .copy_from_slice(&vector_offset.to_le_bytes());
             storage_builder
                 .push_vector_data(&encoded_vector)
                 .map_err(|e| {
@@ -501,7 +503,9 @@ impl<TStorage: EncodedStorage> EncodedVectorsU8<TStorage> {
     fn parse_vec_data(data: &[u8]) -> (f32, *const u8) {
         debug_assert!(data.len() >= ADDITIONAL_CONSTANT_SIZE);
         unsafe {
-            let offset = data.as_ptr().cast::<f32>().read_unaligned();
+            // Offsets are persisted in canonical little-endian.
+            let bits = data.as_ptr().cast::<u32>().read_unaligned();
+            let offset = f32::from_bits(u32::from_le(bits));
             let v_ptr = data.as_ptr().add(ADDITIONAL_CONSTANT_SIZE);
             (offset, v_ptr)
         }
@@ -770,4 +774,64 @@ unsafe extern "C" {
 unsafe extern "C" {
     fn impl_score_dot_neon(query_ptr: *const u8, vector_ptr: *const u8, dim: u32) -> f32;
     fn impl_score_l1_neon(query_ptr: *const u8, vector_ptr: *const u8, dim: u32) -> f32;
+}
+
+#[cfg(test)]
+mod endian_tests {
+    use super::*;
+
+    use crate::encoded_storage::EncodedStorage;
+    use common::counter::hardware_counter::HardwareCounterCell;
+    use common::types::PointOffsetType;
+    use memory::mmap_type::MmapFlusher;
+
+    struct DummyStorage;
+
+    impl EncodedStorage for DummyStorage {
+        fn get_vector_data(&self, _index: PointOffsetType) -> &[u8] {
+            &[]
+        }
+
+        fn is_on_disk(&self) -> bool {
+            false
+        }
+
+        fn upsert_vector(
+            &mut self,
+            _id: PointOffsetType,
+            _vector: &[u8],
+            _hw_counter: &HardwareCounterCell,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn vectors_count(&self) -> usize {
+            0
+        }
+
+        fn flusher(&self) -> MmapFlusher {
+            Box::new(|| Ok(()))
+        }
+
+        fn files(&self) -> Vec<std::path::PathBuf> {
+            vec![]
+        }
+
+        fn immutable_files(&self) -> Vec<std::path::PathBuf> {
+            vec![]
+        }
+    }
+
+    #[test]
+    fn parse_vec_data_reads_offset_as_le() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&1.0f32.to_le_bytes());
+        data.extend_from_slice(&[1u8, 2u8, 3u8]);
+
+        let (offset, v_ptr) = EncodedVectorsU8::<DummyStorage>::parse_vec_data(&data);
+        assert!((offset - 1.0).abs() < f32::EPSILON);
+
+        let code = unsafe { std::slice::from_raw_parts(v_ptr, 3) };
+        assert_eq!(code, &[1u8, 2u8, 3u8]);
+    }
 }

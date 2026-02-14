@@ -423,6 +423,19 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
         &self.encoded_vectors
     }
 
+    #[inline]
+    fn canonicalize_words_in_place(words: &mut [TBitsStoreType]) {
+        // Persist words in canonical little-endian. On big-endian we also swap query words so that
+        // scoring stays consistent with the on-disk representation (and remains zero-copy).
+        if cfg!(target_endian = "big") {
+            for word in words {
+                // Swap bytes in-place (e.g. u128) so the on-disk representation is canonical LE.
+                // For u8 this is a no-op.
+                bytemuck::bytes_of_mut(word).reverse();
+            }
+        }
+    }
+
     pub fn encode<'a>(
         orig_data: impl Iterator<Item = impl AsRef<[f32]> + 'a> + Clone,
         mut storage_builder: impl EncodedStorageBuilder<Storage = TStorage>,
@@ -456,7 +469,8 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
                 return Err(EncodingError::Stopped);
             }
 
-            let encoded_vector = Self::encode_vector(vector.as_ref(), &vector_stats, encoding);
+            let mut encoded_vector = Self::encode_vector(vector.as_ref(), &vector_stats, encoding);
+            Self::canonicalize_words_in_place(&mut encoded_vector.encoded_vector);
             let encoded_vector_slice = encoded_vector.encoded_vector.as_slice();
             // TODO Safety: bytemuck::Pod type, but is it enough for slice?
             #[expect(deprecated, reason = "legacy code")]
@@ -660,7 +674,7 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
         encoding: Encoding,
         query_encoding: QueryEncoding,
     ) -> EncodedQueryBQ<TBitsStoreType> {
-        match query_encoding {
+        let mut encoded = match query_encoding {
             QueryEncoding::SameAsStorage => {
                 EncodedQueryBQ::Binary(Self::encode_vector(query, vector_stats, encoding))
             }
@@ -670,7 +684,16 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
             QueryEncoding::Scalar4bits => EncodedQueryBQ::Scalar4bits(
                 Self::encode_scalar_query_vector(query, encoding, (u8::BITS / 2) as usize),
             ),
+        };
+
+        match &mut encoded {
+            EncodedQueryBQ::Binary(v) => Self::canonicalize_words_in_place(&mut v.encoded_vector),
+            EncodedQueryBQ::Scalar4bits(v) | EncodedQueryBQ::Scalar8bits(v) => {
+                Self::canonicalize_words_in_place(&mut v.encoded_vector)
+            }
         }
+
+        encoded
     }
 
     fn encode_scalar_query_vector(
@@ -910,8 +933,9 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage> EncodedVectors
         vector: &[f32],
         hw_counter: &HardwareCounterCell,
     ) -> std::io::Result<()> {
-        let encoded_vector =
+        let mut encoded_vector =
             Self::encode_vector(vector, &self.metadata.vector_stats, self.metadata.encoding);
+        Self::canonicalize_words_in_place(&mut encoded_vector.encoded_vector);
         self.encoded_vectors.upsert_vector(
             id,
             bytemuck::cast_slice(encoded_vector.encoded_vector.as_slice()),
