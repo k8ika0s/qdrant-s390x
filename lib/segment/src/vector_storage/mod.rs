@@ -1,6 +1,12 @@
-#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod async_io;
-#[cfg(not(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
 mod async_io_mock;
 #[cfg(target_os = "linux")]
 pub mod async_raw_scorer;
@@ -9,6 +15,7 @@ mod chunked_mmap_vectors;
 pub mod chunked_vectors;
 pub mod common;
 pub mod dense;
+mod mmap_endian;
 pub mod multi_dense;
 pub mod quantized;
 pub mod query;

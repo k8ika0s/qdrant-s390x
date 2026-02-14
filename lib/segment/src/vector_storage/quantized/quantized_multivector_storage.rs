@@ -15,12 +15,32 @@ use crate::common::operation_error::OperationResult;
 use crate::data_types::vectors::{TypedMultiDenseVectorRef, VectorElementType};
 use crate::types::{MultiVectorComparator, MultiVectorConfig};
 use crate::vector_storage::chunked_mmap_vectors::ChunkedMmapVectors;
+use crate::vector_storage::mmap_endian::MmapEndianConvertible;
 use crate::vector_storage::{Random, VectorOffsetType};
 
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct MultivectorOffset {
     pub start: PointOffsetType,
     pub count: PointOffsetType,
+}
+
+impl MmapEndianConvertible for MultivectorOffset {
+    #[inline]
+    fn to_le_storage(self) -> Self {
+        Self {
+            start: self.start.to_le(),
+            count: self.count.to_le(),
+        }
+    }
+
+    #[inline]
+    fn from_le_storage(stored: Self) -> Self {
+        Self {
+            start: PointOffsetType::from_le(stored.start),
+            count: PointOffsetType::from_le(stored.count),
+        }
+    }
 }
 
 pub trait MultivectorOffsets {

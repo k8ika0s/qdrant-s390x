@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::mem::{MaybeUninit, size_of, transmute};
+use std::mem::{MaybeUninit, size_of};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -28,6 +28,7 @@ use crate::vector_storage::async_io::UringReader;
 )))]
 use crate::vector_storage::async_io_mock::UringReader;
 use crate::vector_storage::common::VECTOR_READ_BATCH_SIZE;
+use crate::vector_storage::mmap_endian::MmapEndianConvertible;
 use crate::vector_storage::query_scorer::is_read_with_prefetch_efficient;
 use crate::vector_storage::{AccessPattern, Random, Sequential};
 
@@ -38,7 +39,7 @@ const DELETED_LAYOUT_BLOCK_BYTES: usize = size_of::<u64>();
 
 /// Mem-mapped file for dense vectors
 #[derive(Debug)]
-pub struct MmapDenseVectors<T: PrimitiveVectorElement> {
+pub struct MmapDenseVectors<T: PrimitiveVectorElement + MmapEndianConvertible> {
     pub dim: usize,
     pub num_vectors: usize,
     /// Main vector data mmap for read/write
@@ -64,9 +65,21 @@ pub struct MmapDenseVectors<T: PrimitiveVectorElement> {
     deleted: MmapBitSlice,
     /// Current number of deleted vectors.
     pub deleted_count: usize,
+    /// Cached decoded vectors for BE hosts.
+    decoded_vectors: Option<Vec<T>>,
 }
 
-impl<T: PrimitiveVectorElement> MmapDenseVectors<T> {
+impl<T: PrimitiveVectorElement + MmapEndianConvertible> MmapDenseVectors<T> {
+    #[inline]
+    fn typed_slice_from_bytes(bytes: &[u8], values_count: usize) -> &[T] {
+        debug_assert_eq!(bytes.len(), values_count * size_of::<T>());
+        // Safety:
+        // - caller provides exact element count for `bytes`
+        // - vector payload starts after a fixed 4-byte header and uses element types
+        //   with <= 4-byte alignment, so typed view alignment is preserved
+        unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<T>(), values_count) }
+    }
+
     pub fn open(
         vectors_path: &Path,
         deleted_path: &Path,
@@ -95,6 +108,11 @@ impl<T: PrimitiveVectorElement> MmapDenseVectors<T> {
         };
 
         let num_vectors = (mmap.len() - HEADER_SIZE) / dim / size_of::<T>();
+        let decoded_vectors = if cfg!(target_endian = "big") {
+            Some(Self::decode_vectors(&mmap, dim, num_vectors))
+        } else {
+            None
+        };
 
         // Allocate/open deleted mmap
         let deleted_mmap_size = deleted_mmap_size(num_vectors);
@@ -130,7 +148,20 @@ impl<T: PrimitiveVectorElement> MmapDenseVectors<T> {
             uring_reader: uring_reader.map(Mutex::new),
             deleted,
             deleted_count,
+            decoded_vectors,
         })
+    }
+
+    #[inline]
+    fn decode_vectors(mmap: &Mmap, dim: usize, num_vectors: usize) -> Vec<T> {
+        let values_count = dim * num_vectors;
+        let values_size = values_count * size_of::<T>();
+        let byte_slice = &mmap[HEADER_SIZE..HEADER_SIZE + values_size];
+        let stored = Self::typed_slice_from_bytes(byte_slice, values_count);
+        stored
+            .iter()
+            .map(|value| T::from_le_storage(*value))
+            .collect()
     }
 
     pub fn has_async_reader(&self) -> bool {
@@ -154,21 +185,20 @@ impl<T: PrimitiveVectorElement> MmapDenseVectors<T> {
         self.dim * size_of::<T>()
     }
 
-    /// Helper to get a slice suited for sequential reads if available, otherwise use the main mmap
-    #[inline]
-    fn mmap_seq(&self) -> Arc<Mmap> {
-        #[expect(clippy::used_underscore_binding)]
-        self._mmap_seq.clone().unwrap_or_else(|| self.mmap.clone())
-    }
-
     fn raw_vector_offset<P: AccessPattern>(&self, offset: usize) -> &[T] {
-        let mmap = if P::IS_SEQUENTIAL {
-            &self.mmap_seq()
+        if let Some(decoded_vectors) = &self.decoded_vectors {
+            let vector_start = (offset - HEADER_SIZE) / size_of::<T>();
+            let vector_end = vector_start + self.dim;
+            return &decoded_vectors[vector_start..vector_end];
+        }
+
+        let mmap: &Mmap = if P::IS_SEQUENTIAL {
+            self._mmap_seq.as_deref().unwrap_or(self.mmap.as_ref())
         } else {
-            &self.mmap
+            self.mmap.as_ref()
         };
         let byte_slice = &mmap[offset..(offset + self.raw_size())];
-        let arr: &[T] = unsafe { transmute(byte_slice) };
+        let arr = Self::typed_slice_from_bytes(byte_slice, self.dim);
         &arr[0..self.dim]
     }
 
