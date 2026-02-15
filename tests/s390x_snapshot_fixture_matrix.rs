@@ -120,6 +120,22 @@ fn s390x_snapshot_fixture_produce() {
         snapshot_file: sparse_snapshot_name.to_string(),
     });
 
+    // Fixture 3: binary quantization (covers BQ persistence + scoring correctness).
+    let bq = "s390x_fixture_bq";
+    http_delete_collection_if_exists(&client, &base_url, bq, &log_path);
+    http_create_binary_quant_collection(&client, &base_url, bq, &log_path);
+    http_upsert_binary_quant_points(&client, &base_url, bq, &log_path);
+    http_search_binary_quant_and_assert(&client, &base_url, bq, &log_path);
+    let bq_snapshot =
+        http_create_collection_snapshot(&client, &base_url, bq, &snapshots_path, &log_path);
+    let bq_snapshot_name = "bq.snapshot.gz";
+    gzip_fixture(&bq_snapshot, &out_dir, bq_snapshot_name);
+    fixtures.push(SnapshotFixtureEntry {
+        id: "bq".to_string(),
+        collection: bq.to_string(),
+        snapshot_file: bq_snapshot_name.to_string(),
+    });
+
     qdrant.shutdown();
 
     let manifest = SnapshotFixtureManifest {
@@ -150,12 +166,8 @@ fn s390x_snapshot_fixture_consume() {
 
     let file = File::open(&manifest_path)
         .unwrap_or_else(|e| panic!("open manifest failed: {e} ({})", manifest_path.display()));
-    let manifest: SnapshotFixtureManifest = serde_json::from_reader(file).unwrap_or_else(|e| {
-        panic!(
-            "parse manifest failed: {e} ({})",
-            manifest_path.display()
-        )
-    });
+    let manifest: SnapshotFixtureManifest = serde_json::from_reader(file)
+        .unwrap_or_else(|e| panic!("parse manifest failed: {e} ({})", manifest_path.display()));
 
     // QEMU s390x runs can be significantly slower than native; keep timeouts generous
     // to avoid flaking the cross-endian producer/consumer gates.
@@ -191,10 +203,7 @@ fn s390x_snapshot_fixture_consume() {
 
         let source_fixture = in_dir.join(&entry.snapshot_file);
         if !source_fixture.exists() {
-            panic!(
-                "missing fixture snapshot: {}",
-                source_fixture.display()
-            );
+            panic!("missing fixture snapshot: {}", source_fixture.display());
         }
 
         let snapshot_path = materialize_snapshot_fixture(&source_fixture, tmp.path());
@@ -227,7 +236,27 @@ fn s390x_snapshot_fixture_consume() {
                     3,
                     &log_path,
                 );
-                http_scroll_sparse_and_assert_sorted(&client, &base_url, &entry.collection, &log_path);
+                http_scroll_sparse_and_assert_sorted(
+                    &client,
+                    &base_url,
+                    &entry.collection,
+                    &log_path,
+                );
+            }
+            "bq" => {
+                http_collection_points_and_assert_at_least(
+                    &client,
+                    &base_url,
+                    &entry.collection,
+                    8,
+                    &log_path,
+                );
+                http_search_binary_quant_and_assert(
+                    &client,
+                    &base_url,
+                    &entry.collection,
+                    &log_path,
+                );
             }
             other => panic!("unknown fixture id: {other}"),
         }
@@ -305,8 +334,12 @@ fn materialize_snapshot_fixture(source_fixture: &Path, tmp_dir: &Path) -> PathBu
     let input = File::open(source_fixture)
         .unwrap_or_else(|e| panic!("open gz fixture failed: {e} ({})", source_fixture.display()));
     let mut decoder = GzDecoder::new(std::io::BufReader::new(input));
-    let output = File::create(&out_path)
-        .unwrap_or_else(|e| panic!("create inflated fixture failed: {e} ({})", out_path.display()));
+    let output = File::create(&out_path).unwrap_or_else(|e| {
+        panic!(
+            "create inflated fixture failed: {e} ({})",
+            out_path.display()
+        )
+    });
     let mut output = std::io::BufWriter::new(output);
     std::io::copy(&mut decoder, &mut output).expect("inflate gzip");
 
@@ -337,7 +370,10 @@ fn wait_ready(client: &Client, base_url: &str, log_path: &Path) {
             Ok(resp) if resp.status().is_success() => return,
             _ => {
                 if start.elapsed() > Duration::from_secs(30) {
-                    panic!("qdrant did not become ready in time\n{}", tail_log(log_path));
+                    panic!(
+                        "qdrant did not become ready in time\n{}",
+                        tail_log(log_path)
+                    );
                 }
                 thread::sleep(Duration::from_millis(200));
             }
@@ -365,11 +401,19 @@ fn http_delete_collection_if_exists(
     if !(resp.status().is_success() || resp.status().as_u16() == 404) {
         let status = resp.status();
         let body = resp.text().unwrap_or_default();
-        panic!("delete collection failed: {status} {body}\n{}", tail_log(log_path));
+        panic!(
+            "delete collection failed: {status} {body}\n{}",
+            tail_log(log_path)
+        );
     }
 }
 
-fn http_create_multivec_collection(client: &Client, base_url: &str, collection: &str, log_path: &Path) {
+fn http_create_multivec_collection(
+    client: &Client,
+    base_url: &str,
+    collection: &str,
+    log_path: &Path,
+) {
     // Small but meaningful multi-vector config:
     // - on-disk dense vectors -> chunked mmap vector storage
     // - scalar int8 quantization -> quantization persistence paths
@@ -451,16 +495,29 @@ fn http_upsert_multivec_points(client: &Client, base_url: &str, collection: &str
         ))
         .json(&body)
         .send()
-        .unwrap_or_else(|e| panic!("upsert multivec points request failed: {e}\n{}", tail_log(log_path)));
+        .unwrap_or_else(|e| {
+            panic!(
+                "upsert multivec points request failed: {e}\n{}",
+                tail_log(log_path)
+            )
+        });
 
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().unwrap_or_default();
-        panic!("upsert multivec points failed: {status} {body}\n{}", tail_log(log_path));
+        panic!(
+            "upsert multivec points failed: {status} {body}\n{}",
+            tail_log(log_path)
+        );
     }
 }
 
-fn http_search_multivec_and_assert(client: &Client, base_url: &str, collection: &str, log_path: &Path) {
+fn http_search_multivec_and_assert(
+    client: &Client,
+    base_url: &str,
+    collection: &str,
+    log_path: &Path,
+) {
     let body = json!({
         "vector": { "name": "image", "vector": [0.2, 0.1, 0.9, 0.7] },
         "limit": 3
@@ -470,21 +527,37 @@ fn http_search_multivec_and_assert(client: &Client, base_url: &str, collection: 
         .post(format!("{base_url}/collections/{collection}/points/search"))
         .json(&body)
         .send()
-        .unwrap_or_else(|e| panic!("multivec search request failed: {e}\n{}", tail_log(log_path)));
+        .unwrap_or_else(|e| {
+            panic!(
+                "multivec search request failed: {e}\n{}",
+                tail_log(log_path)
+            )
+        });
 
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().unwrap_or_default();
-        panic!("multivec search failed: {status} {body}\n{}", tail_log(log_path));
+        panic!(
+            "multivec search failed: {status} {body}\n{}",
+            tail_log(log_path)
+        );
     }
 
-    let v: serde_json::Value = resp
-        .json()
-        .unwrap_or_else(|e| panic!("parse multivec search response failed: {e}\n{}", tail_log(log_path)));
+    let v: serde_json::Value = resp.json().unwrap_or_else(|e| {
+        panic!(
+            "parse multivec search response failed: {e}\n{}",
+            tail_log(log_path)
+        )
+    });
     let hits = v
         .get("result")
         .and_then(|r| r.as_array())
-        .unwrap_or_else(|| panic!("search response missing result array: {v}\n{}", tail_log(log_path)));
+        .unwrap_or_else(|| {
+            panic!(
+                "search response missing result array: {v}\n{}",
+                tail_log(log_path)
+            )
+        });
     assert!(
         !hits.is_empty(),
         "expected at least one search hit\nresponse={v}\n{}",
@@ -492,7 +565,151 @@ fn http_search_multivec_and_assert(client: &Client, base_url: &str, collection: 
     );
 }
 
-fn http_create_sparse_collection(client: &Client, base_url: &str, collection: &str, log_path: &Path) {
+fn http_create_binary_quant_collection(
+    client: &Client,
+    base_url: &str,
+    collection: &str,
+    log_path: &Path,
+) {
+    // Small but meaningful binary-quantized config:
+    // - on-disk dense vectors -> mmap vector storage
+    // - binary quantization -> BQ persistence paths
+    let bq = json!({ "encoding": "one_bit", "query_encoding": "binary" });
+    let body = json!({
+        "vectors": {
+            "size": 8,
+            "distance": "Dot",
+            "quantization_config": { "binary": bq.clone() },
+            "on_disk": true
+        },
+        "hnsw_config": { "m": 8, "ef_construct": 64 },
+        "quantization": { "binary": bq },
+        "optimizers_config": { "default_segment_number": 1 },
+        "replication_factor": 1
+    });
+
+    let resp = client
+        .put(format!("{base_url}/collections/{collection}"))
+        .json(&body)
+        .send()
+        .unwrap_or_else(|e| {
+            panic!(
+                "create binary-quant collection request failed: {e}\n{}",
+                tail_log(log_path)
+            )
+        });
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().unwrap_or_default();
+        panic!(
+            "create binary-quant collection failed: {status} {body}\n{}",
+            tail_log(log_path)
+        );
+    }
+}
+
+fn http_upsert_binary_quant_points(
+    client: &Client,
+    base_url: &str,
+    collection: &str,
+    log_path: &Path,
+) {
+    // Keep this deterministic (no rng) so fixtures are reproducible.
+    let points: Vec<_> = (1..=8)
+        .map(|id| {
+            let x = id as f32 / 10.0;
+            json!({
+                "id": id,
+                "vector": [x, 0.2, 0.3, 0.4, x, 0.2, 0.3, 0.4],
+                "payload": { "id": id }
+            })
+        })
+        .collect();
+    let body = json!({ "points": points });
+
+    let resp = client
+        .put(format!(
+            "{base_url}/collections/{collection}/points?wait=true"
+        ))
+        .json(&body)
+        .send()
+        .unwrap_or_else(|e| {
+            panic!(
+                "upsert binary-quant points request failed: {e}\n{}",
+                tail_log(log_path)
+            )
+        });
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().unwrap_or_default();
+        panic!(
+            "upsert binary-quant points failed: {status} {body}\n{}",
+            tail_log(log_path)
+        );
+    }
+}
+
+fn http_search_binary_quant_and_assert(
+    client: &Client,
+    base_url: &str,
+    collection: &str,
+    log_path: &Path,
+) {
+    let body = json!({
+        "vector": [0.2, 0.1, 0.9, 0.7, 0.2, 0.1, 0.9, 0.7],
+        "limit": 3
+    });
+
+    let resp = client
+        .post(format!("{base_url}/collections/{collection}/points/search"))
+        .json(&body)
+        .send()
+        .unwrap_or_else(|e| {
+            panic!(
+                "binary-quant search request failed: {e}\n{}",
+                tail_log(log_path)
+            )
+        });
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().unwrap_or_default();
+        panic!(
+            "binary-quant search failed: {status} {body}\n{}",
+            tail_log(log_path)
+        );
+    }
+
+    let v: serde_json::Value = resp.json().unwrap_or_else(|e| {
+        panic!(
+            "parse binary-quant search response failed: {e}\n{}",
+            tail_log(log_path)
+        )
+    });
+    let hits = v
+        .get("result")
+        .and_then(|r| r.as_array())
+        .unwrap_or_else(|| {
+            panic!(
+                "search response missing result array: {v}\n{}",
+                tail_log(log_path)
+            )
+        });
+    assert!(
+        !hits.is_empty(),
+        "expected at least one search hit\nresponse={v}\n{}",
+        tail_log(log_path)
+    );
+}
+
+fn http_create_sparse_collection(
+    client: &Client,
+    base_url: &str,
+    collection: &str,
+    log_path: &Path,
+) {
     let body = json!({
         "sparse_vectors": {
             "text": {}
@@ -537,16 +754,29 @@ fn http_upsert_sparse_points(client: &Client, base_url: &str, collection: &str, 
         ))
         .json(&body)
         .send()
-        .unwrap_or_else(|e| panic!("upsert sparse points request failed: {e}\n{}", tail_log(log_path)));
+        .unwrap_or_else(|e| {
+            panic!(
+                "upsert sparse points request failed: {e}\n{}",
+                tail_log(log_path)
+            )
+        });
 
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().unwrap_or_default();
-        panic!("upsert sparse points failed: {status} {body}\n{}", tail_log(log_path));
+        panic!(
+            "upsert sparse points failed: {status} {body}\n{}",
+            tail_log(log_path)
+        );
     }
 }
 
-fn http_scroll_sparse_and_assert_sorted(client: &Client, base_url: &str, collection: &str, log_path: &Path) {
+fn http_scroll_sparse_and_assert_sorted(
+    client: &Client,
+    base_url: &str,
+    collection: &str,
+    log_path: &Path,
+) {
     let body = json!({ "limit": 10, "with_vector": true });
 
     let resp = client
@@ -558,17 +788,28 @@ fn http_scroll_sparse_and_assert_sorted(client: &Client, base_url: &str, collect
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().unwrap_or_default();
-        panic!("sparse scroll failed: {status} {body}\n{}", tail_log(log_path));
+        panic!(
+            "sparse scroll failed: {status} {body}\n{}",
+            tail_log(log_path)
+        );
     }
 
-    let v: serde_json::Value = resp
-        .json()
-        .unwrap_or_else(|e| panic!("parse sparse scroll response failed: {e}\n{}", tail_log(log_path)));
+    let v: serde_json::Value = resp.json().unwrap_or_else(|e| {
+        panic!(
+            "parse sparse scroll response failed: {e}\n{}",
+            tail_log(log_path)
+        )
+    });
 
     let points = v
         .pointer("/result/points")
         .and_then(|p| p.as_array())
-        .unwrap_or_else(|| panic!("scroll response missing result.points array: {v}\n{}", tail_log(log_path)));
+        .unwrap_or_else(|| {
+            panic!(
+                "scroll response missing result.points array: {v}\n{}",
+                tail_log(log_path)
+            )
+        });
 
     assert!(
         points.len() >= 3,
@@ -584,7 +825,10 @@ fn http_scroll_sparse_and_assert_sorted(client: &Client, base_url: &str, collect
         let indices: Vec<u64> = indices.iter().map(|x| x.as_u64().unwrap()).collect();
         let mut sorted = indices.clone();
         sorted.sort_unstable();
-        assert_eq!(indices, sorted, "sparse indices must be sorted: {indices:?}");
+        assert_eq!(
+            indices, sorted,
+            "sparse indices must be sorted: {indices:?}"
+        );
     }
 }
 
@@ -603,12 +847,18 @@ fn http_collection_points_and_assert_at_least(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().unwrap_or_default();
-        panic!("get collection failed: {status} {body}\n{}", tail_log(log_path));
+        panic!(
+            "get collection failed: {status} {body}\n{}",
+            tail_log(log_path)
+        );
     }
 
-    let v: serde_json::Value = resp
-        .json()
-        .unwrap_or_else(|e| panic!("parse collection response failed: {e}\n{}", tail_log(log_path)));
+    let v: serde_json::Value = resp.json().unwrap_or_else(|e| {
+        panic!(
+            "parse collection response failed: {e}\n{}",
+            tail_log(log_path)
+        )
+    });
 
     let points = v
         .pointer("/result/points_count")
@@ -639,7 +889,12 @@ fn http_create_collection_snapshot(
             "{base_url}/collections/{collection}/snapshots?wait=true"
         ))
         .send()
-        .unwrap_or_else(|e| panic!("create snapshot request failed: {e}\n{}", tail_log(log_path)));
+        .unwrap_or_else(|e| {
+            panic!(
+                "create snapshot request failed: {e}\n{}",
+                tail_log(log_path)
+            )
+        });
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -660,7 +915,12 @@ fn http_create_collection_snapshot(
     let name = v
         .pointer("/result/name")
         .and_then(|n| n.as_str())
-        .unwrap_or_else(|| panic!("snapshot response missing result.name: {v}\n{}", tail_log(log_path)));
+        .unwrap_or_else(|| {
+            panic!(
+                "snapshot response missing result.name: {v}\n{}",
+                tail_log(log_path)
+            )
+        });
 
     // Collection snapshots live under `<snapshots_path>/<collection>/<snapshot_name>`.
     let snapshot_path = snapshots_dir.join(collection).join(name);

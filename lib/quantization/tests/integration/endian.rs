@@ -7,6 +7,7 @@ mod tests {
     use quantization::encoded_storage::{TestEncodedStorage, TestEncodedStorageBuilder};
     use quantization::encoded_vectors::{DistanceType, EncodedVectors, VectorParameters};
     use quantization::encoded_vectors_binary::{EncodedVectorsBin, Encoding, QueryEncoding};
+    use rand::{Rng, SeedableRng};
 
     #[test]
     fn test_binary_u128_storage_words_are_little_endian_on_disk() {
@@ -46,5 +47,33 @@ mod tests {
         let counter = HardwareCounterCell::new();
         let score = encoded.score_point(&query_encoded, 0, &counter);
         assert!((score - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_binary_xor_popcnt_invariant_under_byte_swaps() {
+        fn xor_popcnt_u128(v1: &[u128], v2: &[u128]) -> usize {
+            v1.iter()
+                .zip(v2)
+                .map(|(a, b)| (a ^ b).count_ones() as usize)
+                .sum()
+        }
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        for _ in 0..1024 {
+            let mut v1: Vec<u128> = (0..8).map(|_| rng.random()).collect();
+            let mut v2: Vec<u128> = (0..8).map(|_| rng.random()).collect();
+
+            let base = xor_popcnt_u128(&v1, &v2);
+
+            for w in &mut v1 {
+                *w = w.swap_bytes();
+            }
+            for w in &mut v2 {
+                *w = w.swap_bytes();
+            }
+
+            let swapped = xor_popcnt_u128(&v1, &v2);
+            assert_eq!(base, swapped);
+        }
     }
 }

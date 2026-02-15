@@ -20,6 +20,7 @@ use crate::quantile::{find_min_max_from_iter, find_quantile_interval};
 pub const ALIGNMENT: usize = 16;
 // Each encoded vector stores an additional f32 at the beginning. Define it's size here.
 const ADDITIONAL_CONSTANT_SIZE: usize = std::mem::size_of::<f32>();
+const METADATA_FORMAT_VERSION: u32 = 1;
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum ScalarQuantizationMethod {
@@ -81,6 +82,8 @@ impl Metadata {
 
 #[derive(Serialize, Deserialize)]
 struct MetadataInt8 {
+    #[serde(default)]
+    format_version: u32,
     actual_dim: usize,
     alpha: f32,
     offset: f32,
@@ -151,6 +154,7 @@ impl<TStorage: EncodedStorage> EncodedVectorsU8<TStorage> {
 
         if count == 0 {
             let metadata = Metadata::Int8(MetadataInt8 {
+                format_version: METADATA_FORMAT_VERSION,
                 actual_dim,
                 alpha: 0.0,
                 offset: 0.0,
@@ -221,6 +225,7 @@ impl<TStorage: EncodedStorage> EncodedVectorsU8<TStorage> {
         };
 
         let metadata = MetadataInt8 {
+            format_version: METADATA_FORMAT_VERSION,
             actual_dim,
             alpha,
             offset,
@@ -316,6 +321,19 @@ impl<TStorage: EncodedStorage> EncodedVectorsU8<TStorage> {
     pub fn load(encoded_vectors: TStorage, meta_path: &Path) -> std::io::Result<Self> {
         let contents = fs::read_to_string(meta_path)?;
         let metadata: Metadata = serde_json::from_str(&contents)?;
+        match &metadata {
+            Metadata::Int8(meta) => {
+                if meta.format_version > METADATA_FORMAT_VERSION {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "Unsupported scalar quantization metadata format version {}",
+                            meta.format_version
+                        ),
+                    ));
+                }
+            }
+        }
         let result = Self {
             encoded_vectors,
             metadata,
@@ -784,6 +802,7 @@ mod endian_tests {
     use common::counter::hardware_counter::HardwareCounterCell;
     use common::types::PointOffsetType;
     use memory::mmap_type::MmapFlusher;
+    use rand::{Rng, SeedableRng};
 
     struct DummyStorage;
 
@@ -833,5 +852,20 @@ mod endian_tests {
 
         let code = unsafe { std::slice::from_raw_parts(v_ptr, 3) };
         assert_eq!(code, &[1u8, 2u8, 3u8]);
+    }
+
+    #[test]
+    fn parse_vec_data_fuzz_like_smoke() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        for _ in 0..10_000 {
+            let code_len: usize = rng.random_range(0..256);
+            let mut data = vec![0u8; ADDITIONAL_CONSTANT_SIZE + code_len];
+            rng.fill(&mut data[..]);
+
+            let (_offset, v_ptr) = EncodedVectorsU8::<DummyStorage>::parse_vec_data(&data);
+            assert_eq!(v_ptr, unsafe {
+                data.as_ptr().add(ADDITIONAL_CONSTANT_SIZE)
+            });
+        }
     }
 }

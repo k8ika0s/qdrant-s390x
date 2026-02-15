@@ -21,6 +21,8 @@ use crate::{
     VectorParameters,
 };
 
+const METADATA_FORMAT_VERSION: u32 = 1;
+
 pub struct EncodedVectorsBin<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage> {
     encoded_vectors: TStorage,
     metadata: Metadata,
@@ -108,6 +110,8 @@ pub struct EncodedScalarVector<TBitsStoreType: BitsStoreType> {
 
 #[derive(Serialize, Deserialize)]
 struct Metadata {
+    #[serde(default)]
+    format_version: u32,
     vector_parameters: VectorParameters,
     #[serde(default)]
     #[serde(skip_serializing_if = "Encoding::is_one")]
@@ -485,6 +489,7 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
             .map_err(|e| EncodingError::EncodingError(format!("Failed to build storage: {e}",)))?;
 
         let metadata = Metadata {
+            format_version: METADATA_FORMAT_VERSION,
             vector_parameters: vector_parameters.clone(),
             encoding,
             query_encoding,
@@ -521,6 +526,15 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
     pub fn load(encoded_vectors: TStorage, meta_path: &Path) -> std::io::Result<Self> {
         let contents = fs::read_to_string(meta_path)?;
         let metadata: Metadata = serde_json::from_str(&contents)?;
+        if metadata.format_version > METADATA_FORMAT_VERSION {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Unsupported binary quantization metadata format version {}",
+                    metadata.format_version
+                ),
+            ));
+        }
         let result = Self {
             metadata,
             metadata_path: Some(meta_path.to_path_buf()),
