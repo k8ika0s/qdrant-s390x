@@ -1,3 +1,4 @@
+use std::borrow::Borrow;
 #[cfg(any(test, feature = "testing"))]
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::Hash;
@@ -22,6 +23,25 @@ use crate::zeros::WriteZerosExt as _;
 
 type ValuesLen = u32;
 
+#[doc(hidden)]
+pub trait PersistLe: Copy {
+    fn to_le(self) -> Self;
+}
+
+impl PersistLe for u32 {
+    #[inline(always)]
+    fn to_le(self) -> Self {
+        u32::to_le(self)
+    }
+}
+
+impl PersistLe for u64 {
+    #[inline(always)]
+    fn to_le(self) -> Self {
+        u64::to_le(self)
+    }
+}
+
 /// On-disk hash map backed by a memory-mapped file.
 ///
 /// The layout of the memory-mapped file is as follows:
@@ -41,20 +61,41 @@ type ValuesLen = u32;
 /// | key   | values_len | padding | values |
 /// |-------|------------|---------|--------|
 /// | `i64` | `u32`      | `u8[]`  | `V[]`  |
-pub struct MmapHashMap<K: ?Sized, V: Sized + FromBytes + Immutable + IntoBytes + KnownLayout> {
+pub struct MmapHashMap<
+    K: Key + ?Sized,
+    V: Sized + PersistLe + FromBytes + Immutable + IntoBytes + KnownLayout,
+> {
     mmap: Mmap,
     header: Header,
     phf: Function,
+    decoded_keys: Option<Vec<K::OwnedKey>>,
     _phantom_key: PhantomData<K>,
     _phantom_value: PhantomData<V>,
 }
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, FromBytes, Immutable, IntoBytes, KnownLayout)]
+struct HeaderDisk {
+    key_type: [u8; 8],
+    buckets_pos: u64,
+    buckets_count: u64,
+}
+
+#[derive(Copy, Clone, Debug)]
 struct Header {
     key_type: [u8; 8],
     buckets_pos: u64,
     buckets_count: u64,
+}
+
+impl HeaderDisk {
+    fn decode(&self) -> Header {
+        Header {
+            key_type: self.key_type,
+            buckets_pos: u64::from_le(self.buckets_pos),
+            buckets_count: u64::from_le(self.buckets_count),
+        }
+    }
 }
 
 const PADDING_SIZE: usize = 4096;
@@ -70,7 +111,7 @@ pub const READ_ENTRY_OVERHEAD: usize = SIZE_OF_LENGTH_FIELD + SIZE_OF_KEY + BUCK
 
 type BucketOffset = u64;
 
-impl<K: Key + ?Sized, V: Sized + FromBytes + Immutable + IntoBytes + KnownLayout>
+impl<K: Key + ?Sized, V: Sized + PersistLe + FromBytes + Immutable + IntoBytes + KnownLayout>
     MmapHashMap<K, V>
 {
     /// Save `map` contents to `path`.
@@ -89,7 +130,7 @@ impl<K: Key + ?Sized, V: Sized + FromBytes + Immutable + IntoBytes + KnownLayout
 
         let mut file_size = 0;
         // 1. Header
-        file_size += size_of::<Header>();
+        file_size += size_of::<HeaderDisk>();
 
         // 2. PHF
         file_size += phf.write_bytes();
@@ -127,10 +168,10 @@ impl<K: Key + ?Sized, V: Sized + FromBytes + Immutable + IntoBytes + KnownLayout
         let mut bufw = io::BufWriter::new(file);
 
         // 1. Header
-        let header = Header {
+        let header = HeaderDisk {
             key_type: K::NAME,
-            buckets_pos: buckets_pos as u64,
-            buckets_count: keys_count as u64,
+            buckets_pos: (buckets_pos as u64).to_le(),
+            buckets_count: (keys_count as u64).to_le(),
         };
         bufw.write_all(header.as_bytes())?;
 
@@ -143,7 +184,9 @@ impl<K: Key + ?Sized, V: Sized + FromBytes + Immutable + IntoBytes + KnownLayout
         // 4. Buckets
         // Align the buckets to `K::ALIGN`, to make sure Entry.key is aligned.
         bufw.write_zeros(bucket_align)?;
-        bufw.write_all(buckets.as_bytes())?;
+        for bucket in buckets {
+            bufw.write_all(bucket.to_le().as_bytes())?;
+        }
 
         // 5. Data
         let mut pos = 0usize;
@@ -159,10 +202,10 @@ impl<K: Key + ?Sized, V: Sized + FromBytes + Immutable + IntoBytes + KnownLayout
 
             key.write(&mut bufw)?;
             bufw.write_zeros(Self::key_padding_bytes(key))?;
-            bufw.write_all((values.len() as ValuesLen).as_bytes())?;
+            bufw.write_all((values.len() as ValuesLen).to_le().as_bytes())?;
             bufw.write_zeros(Self::values_len_padding_bytes())?;
             for i in values {
-                bufw.write_all(i.as_bytes())?;
+                bufw.write_all(i.to_le().as_bytes())?;
             }
         }
 
@@ -210,8 +253,9 @@ impl<K: Key + ?Sized, V: Sized + FromBytes + Immutable + IntoBytes + KnownLayout
     pub fn open(path: &Path, populate: bool) -> io::Result<Self> {
         let mmap = open_read_mmap(path, AdviceSetting::Global, populate)?;
 
-        let (header, _) =
-            Header::read_from_prefix(mmap.as_ref()).map_err(|_| io::ErrorKind::InvalidData)?;
+        let (header_disk, _) =
+            HeaderDisk::read_from_prefix(mmap.as_ref()).map_err(|_| io::ErrorKind::InvalidData)?;
+        let header = header_disk.decode();
 
         if header.key_type != K::NAME {
             return Err(io::Error::new(
@@ -222,41 +266,47 @@ impl<K: Key + ?Sized, V: Sized + FromBytes + Immutable + IntoBytes + KnownLayout
 
         let phf = Function::read(&mut Cursor::new(
             &mmap
-                .get(size_of::<Header>()..header.buckets_pos as usize)
+                .get(size_of::<HeaderDisk>()..header.buckets_pos as usize)
                 .ok_or(io::ErrorKind::InvalidData)?,
         ))?;
 
-        Ok(MmapHashMap {
+        let mut result = MmapHashMap {
             mmap,
             header,
             phf,
+            decoded_keys: None,
             _phantom_key: PhantomData,
             _phantom_value: PhantomData,
-        })
+        };
+
+        if !K::CAN_READ_REF_FROM_BYTES {
+            let mut decoded_keys = Vec::with_capacity(result.keys_count());
+            for i in 0..result.keys_count() {
+                let entry = result.get_entry(i)?;
+                let key = K::read_owned_from_bytes(entry).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Can't decode key from mmap entry",
+                    )
+                })?;
+                decoded_keys.push(key);
+            }
+            result.decoded_keys = Some(decoded_keys);
+        }
+
+        Ok(result)
     }
 
     pub fn keys_count(&self) -> usize {
         self.header.buckets_count as usize
     }
 
-    pub fn keys(&self) -> impl Iterator<Item = &K> {
-        (0..self.keys_count()).filter_map(|i| match self.get_entry(i) {
-            Ok(entry) => K::from_bytes(entry),
-            Err(err) => {
-                debug_assert!(false, "Error reading entry for key {i}: {err}");
-                log::error!("Error reading entry for key {i}: {err}");
-                None
-            }
-        })
+    pub fn keys(&self) -> impl Iterator<Item = &K> + '_ {
+        KeysIter { map: self, idx: 0 }
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&K, &[V])> {
-        (0..self.keys_count()).filter_map(|i| {
-            let entry = self.get_entry(i).ok()?;
-            let key = K::from_bytes(entry)?;
-            let values = Self::get_values_from_entry(entry, key).ok()?;
-            Some((key, values))
-        })
+    pub fn iter(&self) -> impl Iterator<Item = (&K, &[V])> + '_ {
+        EntriesIter { map: self, idx: 0 }
     }
 
     /// Get the values associated with the `key`.
@@ -300,9 +350,10 @@ impl<K: Key + ?Sized, V: Sized + FromBytes + Immutable + IntoBytes + KnownLayout
                 "Can't read values_len from mmap",
             )
         })?;
+        let values_len = u32::from_le(values_len) as usize;
 
         let values_from = Self::values_len_size_with_padding();
-        let values_to = values_from + values_len as usize * Self::VALUE_SIZE;
+        let values_to = values_from + values_len * Self::VALUE_SIZE;
 
         let entry = entry.get(values_from..values_to).ok_or_else(|| {
             io::Error::new(
@@ -331,6 +382,7 @@ impl<K: Key + ?Sized, V: Sized + FromBytes + Immutable + IntoBytes + KnownLayout
             .get(bucket_from..bucket_to)
             .and_then(|b| <[BucketOffset]>::ref_from_bytes(b).ok())
             .and_then(|buckets| buckets.get(index).copied())
+            .map(u64::from_le)
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -358,8 +410,103 @@ impl<K: Key + ?Sized, V: Sized + FromBytes + Immutable + IntoBytes + KnownLayout
     }
 }
 
+struct KeysIter<
+    'a,
+    K: Key + ?Sized,
+    V: Sized + PersistLe + FromBytes + Immutable + IntoBytes + KnownLayout,
+> {
+    map: &'a MmapHashMap<K, V>,
+    idx: usize,
+}
+
+impl<'a, K: Key + ?Sized, V: Sized + PersistLe + FromBytes + Immutable + IntoBytes + KnownLayout>
+    Iterator for KeysIter<'a, K, V>
+{
+    type Item = &'a K;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(decoded_keys) = self.map.decoded_keys.as_ref() {
+            let key = decoded_keys.get(self.idx)?.borrow();
+            self.idx += 1;
+            return Some(key);
+        }
+
+        while self.idx < self.map.keys_count() {
+            let i = self.idx;
+            self.idx += 1;
+            match self.map.get_entry(i) {
+                Ok(entry) => {
+                    if let Some(key) = K::from_bytes(entry) {
+                        return Some(key);
+                    }
+                }
+                Err(err) => {
+                    debug_assert!(false, "Error reading entry for key {i}: {err}");
+                    log::error!("Error reading entry for key {i}: {err}");
+                }
+            }
+        }
+
+        None
+    }
+}
+
+struct EntriesIter<
+    'a,
+    K: Key + ?Sized,
+    V: Sized + PersistLe + FromBytes + Immutable + IntoBytes + KnownLayout,
+> {
+    map: &'a MmapHashMap<K, V>,
+    idx: usize,
+}
+
+impl<'a, K: Key + ?Sized, V: Sized + PersistLe + FromBytes + Immutable + IntoBytes + KnownLayout>
+    Iterator for EntriesIter<'a, K, V>
+{
+    type Item = (&'a K, &'a [V]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.idx < self.map.keys_count() {
+            let i = self.idx;
+            self.idx += 1;
+
+            let entry = match self.map.get_entry(i) {
+                Ok(entry) => entry,
+                Err(err) => {
+                    debug_assert!(false, "Error reading entry for key {i}: {err}");
+                    log::error!("Error reading entry for key {i}: {err}");
+                    continue;
+                }
+            };
+
+            let key = if let Some(decoded_keys) = self.map.decoded_keys.as_ref() {
+                decoded_keys.get(i)?.borrow()
+            } else {
+                K::from_bytes(entry)?
+            };
+
+            let values = match MmapHashMap::<K, V>::get_values_from_entry(entry, key) {
+                Ok(values) => values,
+                Err(err) => {
+                    debug_assert!(false, "Error reading entry for key {i}: {err}");
+                    log::error!("Error reading entry for key {i}: {err}");
+                    continue;
+                }
+            };
+
+            return Some((key, values));
+        }
+
+        None
+    }
+}
+
 /// A key that can be stored in the hash map.
 pub trait Key: Sync + Hash {
+    type OwnedKey: Borrow<Self> + Hash + Eq + Clone + 'static;
+
+    const CAN_READ_REF_FROM_BYTES: bool;
+
     const ALIGN: usize;
 
     const NAME: [u8; 8];
@@ -375,9 +522,19 @@ pub trait Key: Sync + Hash {
 
     /// Try to read the key from `buf`.
     fn from_bytes(buf: &[u8]) -> Option<&Self>;
+
+    /// Try to read the key from `buf`, producing an owned key if needed.
+    ///
+    /// This is primarily used on big-endian architectures for numeric keys, as the on-disk
+    /// canonical byte order is little-endian.
+    fn read_owned_from_bytes(buf: &[u8]) -> Option<Self::OwnedKey>;
 }
 
 impl Key for str {
+    type OwnedKey = Box<str>;
+
+    const CAN_READ_REF_FROM_BYTES: bool = true;
+
     const ALIGN: usize = align_of::<u8>();
 
     const NAME: [u8; 8] = *b"str\0\0\0\0\0";
@@ -426,9 +583,17 @@ impl Key for str {
         let len = buf.iter().position(|&b| b == 0xFF)?;
         str::from_utf8(&buf[..len]).ok()
     }
+
+    fn read_owned_from_bytes(buf: &[u8]) -> Option<Self::OwnedKey> {
+        Some(Self::from_bytes(buf)?.into())
+    }
 }
 
 impl Key for i64 {
+    type OwnedKey = i64;
+
+    const CAN_READ_REF_FROM_BYTES: bool = cfg!(target_endian = "little");
+
     const ALIGN: usize = align_of::<i64>();
 
     const NAME: [u8; 8] = *b"i64\0\0\0\0\0";
@@ -438,19 +603,32 @@ impl Key for i64 {
     }
 
     fn write(&self, buf: &mut impl Write) -> io::Result<()> {
-        buf.write_all(self.as_bytes())
+        buf.write_all(&self.to_le_bytes())
     }
 
     fn matches(&self, buf: &[u8]) -> bool {
-        buf.get(..size_of::<i64>()) == Some(self.as_bytes())
+        buf.get(..size_of::<i64>()) == Some(self.to_le_bytes().as_ref())
     }
 
     fn from_bytes(buf: &[u8]) -> Option<&Self> {
-        Some(i64::ref_from_prefix(buf).ok()?.0)
+        if Self::CAN_READ_REF_FROM_BYTES {
+            Some(i64::ref_from_prefix(buf).ok()?.0)
+        } else {
+            None
+        }
+    }
+
+    fn read_owned_from_bytes(buf: &[u8]) -> Option<Self::OwnedKey> {
+        let (raw, _) = i64::read_from_prefix(buf).ok()?;
+        Some(i64::from_le(raw))
     }
 }
 
 impl Key for u128 {
+    type OwnedKey = u128;
+
+    const CAN_READ_REF_FROM_BYTES: bool = cfg!(target_endian = "little");
+
     const ALIGN: usize = size_of::<u128>();
 
     const NAME: [u8; 8] = *b"u128\0\0\0\0";
@@ -460,22 +638,31 @@ impl Key for u128 {
     }
 
     fn write(&self, buf: &mut impl Write) -> io::Result<()> {
-        buf.write_all(self.as_bytes())
+        buf.write_all(&self.to_le_bytes())
     }
 
     fn matches(&self, buf: &[u8]) -> bool {
-        buf.get(..size_of::<u128>()) == Some(self.as_bytes())
+        buf.get(..size_of::<u128>()) == Some(self.to_le_bytes().as_ref())
     }
 
     fn from_bytes(buf: &[u8]) -> Option<&Self> {
-        match u128::ref_from_prefix(buf) {
-            Ok(res) => Some(res.0),
-            Err(err) => {
+        if !Self::CAN_READ_REF_FROM_BYTES {
+            return None;
+        }
+
+        u128::ref_from_prefix(buf)
+            .map(|res| res.0)
+            .map_err(|err| {
                 debug_assert!(false, "Error reading u128 from mmap: {err}");
                 log::error!("Error reading u128 from mmap: {err}");
-                None
-            }
-        }
+                err
+            })
+            .ok()
+    }
+
+    fn read_owned_from_bytes(buf: &[u8]) -> Option<Self::OwnedKey> {
+        let (raw, _) = u128::read_from_prefix(buf).ok()?;
+        Some(u128::from_le(raw))
     }
 }
 
@@ -556,7 +743,7 @@ mod tests {
         assert_eq!(mmap.keys().count(), map.len());
 
         for (k, v) in mmap.iter() {
-            let v = v.iter().copied().collect::<BTreeSet<_>>();
+            let v = v.iter().copied().map(u32::from_le).collect::<BTreeSet<_>>();
             assert_eq!(map.get(&from_ref(k)).unwrap(), &v);
         }
 
@@ -565,9 +752,16 @@ mod tests {
 
         // Existing keys should return the correct values
         for (k, v) in map {
+            let expected = v.into_iter().collect::<Vec<_>>();
             assert_eq!(
-                mmap.get(as_ref(&k)).unwrap().unwrap(),
-                &v.into_iter().collect::<Vec<_>>()
+                mmap.get(as_ref(&k))
+                    .unwrap()
+                    .unwrap()
+                    .iter()
+                    .copied()
+                    .map(u32::from_le)
+                    .collect::<Vec<_>>(),
+                expected
             );
         }
     }
@@ -592,9 +786,16 @@ mod tests {
         let mmap = MmapHashMap::<i64, u64>::open(&tmpdir.path().join("map"), true).unwrap();
 
         for (k, v) in map {
+            let expected = v.into_iter().collect::<Vec<_>>();
             assert_eq!(
-                mmap.get(&k).unwrap().unwrap(),
-                &v.into_iter().collect::<Vec<_>>()
+                mmap.get(&k)
+                    .unwrap()
+                    .unwrap()
+                    .iter()
+                    .copied()
+                    .map(u64::from_le)
+                    .collect::<Vec<_>>(),
+                expected
             );
         }
 
@@ -625,9 +826,16 @@ mod tests {
         assert_eq!(keys.len(), map.len());
 
         for (k, v) in map {
+            let expected = v.into_iter().collect::<Vec<_>>();
             assert_eq!(
-                mmap.get(&k).unwrap().unwrap(),
-                &v.into_iter().collect::<Vec<_>>()
+                mmap.get(&k)
+                    .unwrap()
+                    .unwrap()
+                    .iter()
+                    .copied()
+                    .map(u32::from_le)
+                    .collect::<Vec<_>>(),
+                expected
             );
         }
         assert!(mmap.get(&100).unwrap().is_none())
