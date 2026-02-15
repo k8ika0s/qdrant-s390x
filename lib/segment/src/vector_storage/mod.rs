@@ -20,5 +20,6 @@ mod vector_storage_base;
 #[cfg(test)]
 mod tests;
 
+pub use chunked_mmap_vectors::ChunkedMmapVectors;
 pub use raw_scorer::*;
 pub use vector_storage_base::*;
