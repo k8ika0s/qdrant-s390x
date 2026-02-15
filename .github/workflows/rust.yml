@@ -102,6 +102,8 @@ jobs:
         cross test -p common -p gridstore -p quantization --target s390x-unknown-linux-gnu --locked 2>&1 | tee s390x-tests.log
         # Keep this fast/high-signal: only endian-related segment tests (no full segment suite under qemu).
         cross test -p segment --target s390x-unknown-linux-gnu --locked endian 2>&1 | tee -a s390x-tests.log
+        # Routing determinism must be stable across endianness/architectures.
+        cross test -p collection --target s390x-unknown-linux-gnu --locked test_routing_is_stable_across_architectures 2>&1 | tee -a s390x-tests.log
     - name: Upload s390x tests log
       if: always()
       uses: actions/upload-artifact@v6
