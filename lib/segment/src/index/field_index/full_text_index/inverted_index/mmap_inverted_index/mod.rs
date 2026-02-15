@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::path::PathBuf;
 
 use bitvec::vec::BitVec;
@@ -6,10 +7,11 @@ use common::counter::hardware_counter::HardwareCounterCell;
 use common::mmap_hashmap::{MmapHashMap, READ_ENTRY_OVERHEAD};
 use common::types::PointOffsetType;
 use itertools::Either;
+use io::file_operations::atomic_save;
 use memory::fadvise::clear_disk_cache;
 use memory::madvise::AdviceSetting;
 use memory::mmap_ops;
-use memory::mmap_type::{MmapBitSlice, MmapSlice};
+use memory::mmap_type::MmapBitSlice;
 use mmap_postings::{MmapPostingValue, MmapPostings};
 
 use super::immutable_inverted_index::ImmutableInvertedIndex;
@@ -36,6 +38,312 @@ const VOCAB_FILE: &str = "vocab.dat";
 const POINT_TO_TOKENS_COUNT_FILE: &str = "point_to_tokens_count.dat";
 const DELETED_POINTS_FILE: &str = "deleted_points.dat";
 
+const POINT_TO_TOKENS_COUNT_MAGIC: &[u8; 4] = b"pttc";
+const POINT_TO_TOKENS_COUNT_VERSION: u32 = 1;
+const POINT_TO_TOKENS_COUNT_HEADER_SIZE: usize = 16;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LegacyEndian {
+    Little,
+    Big,
+}
+
+fn legacy_usize_from_le_bytes(bytes: &[u8]) -> usize {
+    match std::mem::size_of::<usize>() {
+        8 => u64::from_le_bytes(bytes.try_into().expect("usize-size mismatch")) as usize,
+        4 => u32::from_le_bytes(bytes.try_into().expect("usize-size mismatch")) as usize,
+        other => unreachable!("unsupported usize size: {other}"),
+    }
+}
+
+fn legacy_usize_from_be_bytes(bytes: &[u8]) -> usize {
+    match std::mem::size_of::<usize>() {
+        8 => u64::from_be_bytes(bytes.try_into().expect("usize-size mismatch")) as usize,
+        4 => u32::from_be_bytes(bytes.try_into().expect("usize-size mismatch")) as usize,
+        other => unreachable!("unsupported usize size: {other}"),
+    }
+}
+
+fn detect_legacy_counts_endian(bytes: &[u8]) -> LegacyEndian {
+    let word = std::mem::size_of::<usize>();
+    debug_assert!(word == 4 || word == 8, "unexpected usize size: {word}");
+    if bytes.is_empty() {
+        return if cfg!(target_endian = "little") {
+            LegacyEndian::Little
+        } else {
+            LegacyEndian::Big
+        };
+    }
+
+    let len = bytes.len() / word;
+    let sample = len.min(256);
+
+    let mut max_le: usize = 0;
+    let mut max_be: usize = 0;
+    let mut over_u32_le: usize = 0;
+    let mut over_u32_be: usize = 0;
+
+    for i in 0..sample {
+        let chunk = &bytes[i * word..(i + 1) * word];
+        let le = legacy_usize_from_le_bytes(chunk);
+        let be = legacy_usize_from_be_bytes(chunk);
+        max_le = max_le.max(le);
+        max_be = max_be.max(be);
+        if le > u32::MAX as usize {
+            over_u32_le += 1;
+        }
+        if be > u32::MAX as usize {
+            over_u32_be += 1;
+        }
+    }
+
+    if over_u32_le < over_u32_be {
+        return LegacyEndian::Little;
+    }
+    if over_u32_be < over_u32_le {
+        return LegacyEndian::Big;
+    }
+    if max_le < max_be {
+        return LegacyEndian::Little;
+    }
+    if max_be < max_le {
+        return LegacyEndian::Big;
+    }
+
+    // All-zero, or perfectly ambiguous. Fall back to native.
+    if cfg!(target_endian = "little") {
+        LegacyEndian::Little
+    } else {
+        LegacyEndian::Big
+    }
+}
+
+pub(in crate::index::field_index::full_text_index) struct PointToTokensCount {
+    mmap: memmap2::MmapMut,
+    len: usize,
+}
+
+impl PointToTokensCount {
+    fn validate_header(bytes: &[u8]) -> OperationResult<usize> {
+        if bytes.len() < POINT_TO_TOKENS_COUNT_HEADER_SIZE {
+            return Err(OperationError::service_error(format!(
+                "Corrupted {POINT_TO_TOKENS_COUNT_FILE}: file too small ({})",
+                bytes.len()
+            )));
+        }
+
+        let magic: [u8; 4] = bytes[0..4].try_into().expect("slice length mismatch");
+        if &magic != POINT_TO_TOKENS_COUNT_MAGIC {
+            return Err(OperationError::service_error(format!(
+                "Corrupted {POINT_TO_TOKENS_COUNT_FILE}: bad magic {magic:?}",
+            )));
+        }
+
+        let version = u32::from_le_bytes(bytes[4..8].try_into().expect("slice length mismatch"));
+        if version != POINT_TO_TOKENS_COUNT_VERSION {
+            return Err(OperationError::service_error(format!(
+                "Unsupported {POINT_TO_TOKENS_COUNT_FILE} version: {version}",
+            )));
+        }
+
+        let len_u64 = u64::from_le_bytes(bytes[8..16].try_into().expect("slice length mismatch"));
+        let len = usize::try_from(len_u64).map_err(|_| {
+            OperationError::service_error(format!(
+                "Corrupted {POINT_TO_TOKENS_COUNT_FILE}: len too large ({len_u64})",
+            ))
+        })?;
+
+        let expected = POINT_TO_TOKENS_COUNT_HEADER_SIZE
+            .checked_add(len.checked_mul(std::mem::size_of::<u32>()).ok_or_else(|| {
+                OperationError::service_error(format!(
+                    "Corrupted {POINT_TO_TOKENS_COUNT_FILE}: len overflow ({len})",
+                ))
+            })?)
+            .ok_or_else(|| {
+                OperationError::service_error(format!(
+                    "Corrupted {POINT_TO_TOKENS_COUNT_FILE}: size overflow ({len})",
+                ))
+            })?;
+
+        if bytes.len() != expected {
+            return Err(OperationError::service_error(format!(
+                "Corrupted {POINT_TO_TOKENS_COUNT_FILE}: expected {expected} bytes, got {}",
+                bytes.len()
+            )));
+        }
+
+        Ok(len)
+    }
+
+    pub fn create(path: &std::path::Path, mut iter: impl ExactSizeIterator<Item = usize>) -> OperationResult<()> {
+        let len = iter.len();
+        let file_len = POINT_TO_TOKENS_COUNT_HEADER_SIZE + len * std::mem::size_of::<u32>();
+
+        let _file = mmap_ops::create_and_ensure_length(path, file_len)?;
+        let mut mmap = mmap_ops::open_write_mmap(
+            path,
+            AdviceSetting::Advice(memory::madvise::Advice::Normal), // sequential write
+            false,
+        )?;
+
+        let bytes = mmap.as_mut();
+        bytes[0..4].copy_from_slice(POINT_TO_TOKENS_COUNT_MAGIC);
+        bytes[4..8].copy_from_slice(&POINT_TO_TOKENS_COUNT_VERSION.to_le_bytes());
+        bytes[8..16].copy_from_slice(&(len as u64).to_le_bytes());
+
+        let counts_bytes = &mut bytes[POINT_TO_TOKENS_COUNT_HEADER_SIZE..];
+        debug_assert_eq!(counts_bytes.len(), len * std::mem::size_of::<u32>());
+
+        // SAFETY: header size is 16 (multiple of 4), and the mmap is page-aligned. We also
+        // validated the buffer length is exactly len * 4.
+        let counts: &mut [u32] = unsafe {
+            std::slice::from_raw_parts_mut(counts_bytes.as_mut_ptr().cast::<u32>(), len)
+        };
+        for dst in counts.iter_mut() {
+            let value = iter
+                .next()
+                .expect("iterator size mismatch while writing point_to_tokens_count");
+            let value_u32: u32 = value.try_into().map_err(|_| {
+                OperationError::service_error(format!(
+                    "{POINT_TO_TOKENS_COUNT_FILE}: token count overflows u32 ({value})",
+                ))
+            })?;
+            *dst = value_u32.to_le();
+        }
+
+        // Ensure no trailing elements (ExactSizeIterator contract).
+        debug_assert!(iter.next().is_none());
+
+        if !mmap.is_empty() {
+            mmap.flush()?;
+        }
+        Ok(())
+    }
+
+    fn migrate_legacy(path: &std::path::Path, bytes: &[u8]) -> OperationResult<()> {
+        let word = std::mem::size_of::<usize>();
+        if word != 4 && word != 8 {
+            return Err(OperationError::service_error(format!(
+                "Unsupported usize size for legacy migration: {word}",
+            )));
+        }
+        if !bytes.len().is_multiple_of(word) {
+            return Err(OperationError::service_error(format!(
+                "Corrupted legacy {POINT_TO_TOKENS_COUNT_FILE}: size {} not multiple of {word}",
+                bytes.len()
+            )));
+        }
+
+        let len = bytes.len() / word;
+        let detected = detect_legacy_counts_endian(bytes);
+
+        atomic_save::<OperationError, _>(path, |writer| {
+            writer.write_all(POINT_TO_TOKENS_COUNT_MAGIC)?;
+            writer.write_all(&POINT_TO_TOKENS_COUNT_VERSION.to_le_bytes())?;
+            writer.write_all(&(len as u64).to_le_bytes())?;
+
+            for i in 0..len {
+                let chunk = &bytes[i * word..(i + 1) * word];
+                let value = match detected {
+                    LegacyEndian::Little => legacy_usize_from_le_bytes(chunk),
+                    LegacyEndian::Big => legacy_usize_from_be_bytes(chunk),
+                };
+                let value_u32: u32 = value.try_into().map_err(|_| {
+                    OperationError::service_error(format!(
+                        "legacy {POINT_TO_TOKENS_COUNT_FILE}: token count overflows u32 ({value})",
+                    ))
+                })?;
+                writer.write_all(&value_u32.to_le_bytes())?;
+            }
+            Ok(())
+        })?;
+
+        Ok(())
+    }
+
+    pub fn open(path: &std::path::Path, populate: bool) -> OperationResult<Self> {
+        // Fast header check without mmap first; if legacy, migrate with streaming rewrite.
+        let meta = std::fs::metadata(path).map_err(|err| {
+            OperationError::service_error(format!(
+                "Failed to stat {POINT_TO_TOKENS_COUNT_FILE}: {err}"
+            ))
+        })?;
+        let file_len = usize::try_from(meta.len()).unwrap_or(usize::MAX);
+
+        let is_new = if file_len >= POINT_TO_TOKENS_COUNT_HEADER_SIZE {
+            let mut header = [0u8; 4];
+            std::fs::File::open(path)
+                .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut header))
+                .is_ok()
+                && &header == POINT_TO_TOKENS_COUNT_MAGIC
+        } else {
+            false
+        };
+
+        if !is_new {
+            // Legacy file: mmap-read it to avoid copying large files.
+            let file = std::fs::File::open(path).map_err(|err| {
+                OperationError::service_error(format!(
+                    "Failed to open legacy {POINT_TO_TOKENS_COUNT_FILE}: {err}"
+                ))
+            })?;
+            let legacy_mmap = unsafe { memmap2::Mmap::map(&file)? };
+            Self::migrate_legacy(path, &legacy_mmap)?;
+        }
+
+        let mmap = mmap_ops::open_write_mmap(path, AdviceSetting::Global, populate)?;
+        let len = Self::validate_header(&mmap)?;
+        Ok(Self { mmap, len })
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    fn counts(&self) -> &[u32] {
+        let bytes = &self.mmap[POINT_TO_TOKENS_COUNT_HEADER_SIZE..];
+        // SAFETY: header size is multiple of 4 and mmap is page-aligned.
+        unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<u32>(), self.len) }
+    }
+
+    fn counts_mut(&mut self) -> &mut [u32] {
+        let bytes = &mut self.mmap[POINT_TO_TOKENS_COUNT_HEADER_SIZE..];
+        // SAFETY: header size is multiple of 4 and mmap is page-aligned.
+        unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<u32>(), self.len) }
+    }
+
+    pub fn get(&self, idx: usize) -> Option<usize> {
+        self.counts()
+            .get(idx)
+            .copied()
+            .map(u32::from_le)
+            .map(|v| v as usize)
+    }
+
+    pub fn set_zero(&mut self, idx: usize) -> bool {
+        let Some(slot) = self.counts_mut().get_mut(idx) else {
+            return false;
+        };
+        *slot = 0u32.to_le();
+        true
+    }
+
+    pub fn to_vec(&self) -> Vec<usize> {
+        self.counts()
+            .iter()
+            .copied()
+            .map(u32::from_le)
+            .map(|v| v as usize)
+            .collect()
+    }
+
+    pub fn populate(&self) -> std::io::Result<()> {
+        use memory::madvise::Madviseable as _;
+        self.mmap.populate();
+        Ok(())
+    }
+}
+
 pub struct MmapInvertedIndex {
     pub(in crate::index::field_index::full_text_index) path: PathBuf,
     pub(in crate::index::field_index::full_text_index) storage: Storage,
@@ -47,7 +355,7 @@ pub struct MmapInvertedIndex {
 pub(in crate::index::field_index::full_text_index) struct Storage {
     pub(in crate::index::field_index::full_text_index) postings: MmapPostingsEnum,
     pub(in crate::index::field_index::full_text_index) vocab: MmapHashMap<str, TokenId>,
-    pub(in crate::index::field_index::full_text_index) point_to_tokens_count: MmapSlice<usize>,
+    pub(in crate::index::field_index::full_text_index) point_to_tokens_count: PointToTokensCount,
     pub(in crate::index::field_index::full_text_index) deleted_points:
         MmapBitSliceBufferedUpdateWrapper,
 }
@@ -93,8 +401,7 @@ impl MmapInvertedIndex {
 
         // The actual values go in the slice
         let point_to_tokens_count_iter = point_to_tokens_count.iter().copied();
-
-        MmapSlice::create(&point_to_tokens_count_path, point_to_tokens_count_iter)?;
+        PointToTokensCount::create(&point_to_tokens_count_path, point_to_tokens_count_iter)?;
 
         Ok(())
     }
@@ -123,13 +430,7 @@ impl MmapInvertedIndex {
         };
         let vocab = MmapHashMap::<str, TokenId>::open(&vocab_path, false)?;
 
-        let point_to_tokens_count = unsafe {
-            MmapSlice::try_from(mmap_ops::open_write_mmap(
-                &point_to_tokens_count_path,
-                AdviceSetting::Global,
-                populate,
-            )?)?
-        };
+        let point_to_tokens_count = PointToTokensCount::open(&point_to_tokens_count_path, populate)?;
 
         let deleted =
             mmap_ops::open_write_mmap(&deleted_points_path, AdviceSetting::Global, populate)?;
@@ -429,9 +730,11 @@ impl InvertedIndex for MmapInvertedIndex {
         }
 
         self.storage.deleted_points.set(idx as usize, true);
-        if let Some(count) = self.storage.point_to_tokens_count.get_mut(idx as usize) {
-            *count = 0;
-
+        if self
+            .storage
+            .point_to_tokens_count
+            .set_zero(idx as usize)
+        {
             // `deleted_points`'s length can be larger than `point_to_tokens_count`'s length.
             // Only if the index is within bounds of `point_to_tokens_count`, we decrement the active points count.
             self.active_points_count -= 1;
@@ -489,7 +792,7 @@ impl InvertedIndex for MmapInvertedIndex {
         self.storage
             .point_to_tokens_count
             .get(point_id as usize)
-            .map(|count| *count == 0)
+            .map(|count| count == 0)
             // if the point does not exist, it is considered empty
             .unwrap_or(true)
     }
@@ -507,7 +810,6 @@ impl InvertedIndex for MmapInvertedIndex {
         self.storage
             .point_to_tokens_count
             .get(point_id as usize)
-            .copied()
             // if the point does not exist, it is considered empty
             .unwrap_or(0)
     }
