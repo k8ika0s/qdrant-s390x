@@ -5432,6 +5432,7 @@ dependencies = [
  "config",
  "console-subscriber",
  "constant_time_eq 0.4.2",
+ "flate2",
  "fs-err",
  "futures",
  "futures-util",
