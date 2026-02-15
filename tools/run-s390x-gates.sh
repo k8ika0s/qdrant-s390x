@@ -69,5 +69,12 @@ stage qdrant_http_smoke cargo test -p qdrant --features rocksdb --locked --test 
 # End-to-end snapshot create/restore smoke test (ignored by default; run explicitly here).
 stage qdrant_snapshot_smoke cargo test -p qdrant --features rocksdb --locked --test s390x_snapshot_smoke -- --ignored
 
+if [[ -n "${S390X_FIXTURES_DIR:-}" ]]; then
+  # Cross-endian fixture consumer: restore LE/BE-produced snapshots on this host.
+  stage qdrant_snapshot_fixture_matrix cargo test -p qdrant --features rocksdb --locked --test s390x_snapshot_fixture_matrix -- --ignored
+else
+  echo "# stage=qdrant_snapshot_fixture_matrix skipped (set S390X_FIXTURES_DIR to enable)"
+fi
+
 echo
 echo "All stages completed successfully."
