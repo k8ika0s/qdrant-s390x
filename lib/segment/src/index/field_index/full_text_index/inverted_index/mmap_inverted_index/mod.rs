@@ -845,7 +845,7 @@ mod tests {
     use super::{LegacyEndian, PointToTokensCount, POINT_TO_TOKENS_COUNT_HEADER_SIZE};
 
     #[test]
-    fn test_point_to_tokens_count_migrates_legacy_le_and_be() {
+    fn test_point_to_tokens_count_endian_migrates_legacy_le_and_be() {
         fn write_legacy(path: &std::path::Path, endian: LegacyEndian, values: &[usize]) {
             let mut f = std::fs::File::create(path).expect("create legacy file");
             for &v in values {
