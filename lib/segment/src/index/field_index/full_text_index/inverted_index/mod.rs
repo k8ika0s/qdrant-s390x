@@ -569,7 +569,7 @@ mod tests {
 
             // Check same count
             assert_eq!(
-                *mmap.storage.point_to_tokens_count.get(point_id).unwrap(),
+                mmap.storage.point_to_tokens_count.get(point_id).unwrap(),
                 *count
             );
             assert_eq!(imm_mmap.point_to_tokens_count[point_id], *count);
