@@ -108,6 +108,10 @@ jobs:
         FIXTURES_DIR="dev-docs/s390x-fixtures/ci_$(date +%s)"
         S390X_FIXTURES_DIR="$FIXTURES_DIR" cargo test -p qdrant --locked --test s390x_snapshot_fixture_matrix -- --ignored s390x_snapshot_fixture_produce 2>&1 | tee -a s390x-tests.log
         S390X_FIXTURES_DIR="$FIXTURES_DIR" cross test -p qdrant --target s390x-unknown-linux-gnu --locked --test s390x_snapshot_fixture_matrix -- --ignored s390x_snapshot_fixture_consume 2>&1 | tee -a s390x-tests.log
+        # Inverse direction: produce snapshots under BE s390x (qemu), consume on LE host.
+        FIXTURES_DIR_BE="dev-docs/s390x-fixtures/ci_be_$(date +%s)"
+        S390X_FIXTURES_DIR="$FIXTURES_DIR_BE" cross test -p qdrant --target s390x-unknown-linux-gnu --locked --test s390x_snapshot_fixture_matrix -- --ignored s390x_snapshot_fixture_produce 2>&1 | tee -a s390x-tests.log
+        S390X_FIXTURES_DIR="$FIXTURES_DIR_BE" cargo test -p qdrant --locked --test s390x_snapshot_fixture_matrix -- --ignored s390x_snapshot_fixture_consume 2>&1 | tee -a s390x-tests.log
     - name: Upload s390x tests log
       if: always()
       uses: actions/upload-artifact@v6
