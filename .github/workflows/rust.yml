@@ -77,6 +77,36 @@ jobs:
         name: s390x-check.log
         path: s390x-check.log
 
+  s390x-tests:
+    name: s390x unit tests (qemu, informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+
+    steps:
+    - uses: actions/checkout@v6
+    - uses: Swatinem/rust-cache@v2
+    - name: Install minimal stable
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: s390x-unknown-linux-gnu
+    - name: Install Protoc
+      uses: arduino/setup-protoc@v3
+      with:
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
+    - name: Install cross
+      uses: taiki-e/install-action@cross
+    - name: Run selected unit tests under s390x (qemu)
+      shell: bash
+      run: |
+        set -o pipefail
+        cross test -p common -p gridstore -p quantization --target s390x-unknown-linux-gnu --locked 2>&1 | tee s390x-tests.log
+    - name: Upload s390x tests log
+      if: always()
+      uses: actions/upload-artifact@v6
+      with:
+        name: s390x-tests.log
+        path: s390x-tests.log
+
   # After tests are run, this hacky script will process the JUnit output of nextest
   # and will create a GH Issue if there is a test marked as flaky,
   # Failure of updating an issue is ignored because it fails for external contributors.
