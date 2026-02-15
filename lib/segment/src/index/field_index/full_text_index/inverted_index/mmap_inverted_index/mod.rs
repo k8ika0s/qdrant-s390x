@@ -152,12 +152,14 @@ impl MmapInvertedIndex {
         }))
     }
 
-    pub(super) fn iter_vocab(&self) -> impl Iterator<Item = (&str, &TokenId)> + '_ {
+    pub(super) fn iter_vocab(&self) -> impl Iterator<Item = (&str, TokenId)> + '_ {
         // unwrap safety: we know that each token points to a token id.
-        self.storage
-            .vocab
-            .iter()
-            .map(|(k, v)| (k, v.first().unwrap()))
+        self.storage.vocab.iter().filter_map(|(k, v)| {
+            v.first()
+                .copied()
+                .map(TokenId::from_le)
+                .map(|token_id| (k, token_id))
+        })
     }
 
     /// Returns whether the point id is valid and active.
@@ -461,7 +463,7 @@ impl InvertedIndex for MmapInvertedIndex {
     }
 
     fn vocab_with_postings_len_iter(&self) -> impl Iterator<Item = (&str, usize)> + '_ {
-        self.iter_vocab().filter_map(move |(token, &token_id)| {
+        self.iter_vocab().filter_map(move |(token, token_id)| {
             self.storage
                 .postings
                 .posting_len(token_id)
@@ -530,5 +532,6 @@ impl InvertedIndex for MmapInvertedIndex {
             .flatten()
             .and_then(<[TokenId]>::first)
             .copied()
+            .map(TokenId::from_le)
     }
 }

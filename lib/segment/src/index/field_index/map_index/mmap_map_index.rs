@@ -293,8 +293,9 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
                 Box::new(
                     slice
                         .iter()
-                        .filter(|idx| !self.storage.deleted.get(**idx as usize).unwrap_or(false))
-                        .copied(),
+                        .copied()
+                        .map(PointOffsetType::from_le)
+                        .filter(|idx| !self.storage.deleted.get(*idx as usize).unwrap_or(false)),
                 )
             }
             Ok(None) => {
@@ -323,7 +324,9 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
         self.storage.value_to_points.iter().map(|(k, v)| {
             let count = v
                 .iter()
-                .filter(|idx| !self.storage.deleted.get(**idx as usize).unwrap_or(true))
+                .copied()
+                .map(PointOffsetType::from_le)
+                .filter(|idx| !self.storage.deleted.get(*idx as usize).unwrap_or(true))
                 .unique()
                 .count();
             (k, count)
@@ -346,6 +349,7 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
                 Box::new(
                     v.iter()
                         .copied()
+                        .map(PointOffsetType::from_le)
                         .filter(|idx| !self.storage.deleted.get(*idx as usize).unwrap_or(true))
                         .measure_hw_with_acc(
                             hw_counter.new_accumulator(),
