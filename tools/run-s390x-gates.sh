@@ -16,11 +16,16 @@ OUT_DIR="${1:-dev-docs/s390x-validation}"
 mkdir -p "$OUT_DIR"
 
 ts="$(date -u +%Y%m%dT%H%M%SZ)"
+arch="$(uname -m 2>/dev/null || echo unknown)"
+endian="$(
+  rustc --print cfg 2>/dev/null | grep '^target_endian=' | head -n 1 | cut -d'\"' -f2 || true
+)"
+endian="${endian:-unknown}"
 
 stage() {
   local name="$1"
   shift
-  local log="${OUT_DIR}/${name}_${ts}.log"
+  local log="${OUT_DIR}/${name}_${arch}_${endian}_${ts}.log"
 
   {
     echo "# stage=${name}"
@@ -51,6 +56,7 @@ stage workspace_build_tests cargo build --workspace --features rocksdb --tests -
 
 # High-signal, fast unit test slices.
 stage common_stable_hash cargo test -p common stable_hash --locked
+stage collection_routing cargo test -p collection --locked test_routing_is_stable_across_architectures
 stage quantization cargo test -p quantization --locked
 stage segment_endian cargo test -p segment endian --locked
 
