@@ -150,6 +150,10 @@ name = "hnsw_persistence_smoke"
 harness = false
 
 [[bench]]
+name = "chunked_mmap_vectors_smoke"
+harness = false
+
+[[bench]]
 name = "conditional_search"
 harness = false
 

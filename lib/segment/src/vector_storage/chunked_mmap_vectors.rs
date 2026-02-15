@@ -680,6 +680,130 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_endian = "big")]
+    fn test_chunked_mmap_migrates_legacy_status_file_native_be() {
+        let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
+        let dim = 32;
+        let vector_count = 17;
+        let hw_counter = HardwareCounterCell::new();
+
+        {
+            let mut storage: ChunkedMmapVectors<VectorElementType> =
+                ChunkedMmapVectors::open(dir.path(), dim, AdviceSetting::Global, Some(true))
+                    .unwrap();
+            for i in 0..vector_count {
+                let vector = vec![i as VectorElementType; dim];
+                storage.push(&vector, &hw_counter).unwrap();
+            }
+            storage.flusher()().unwrap();
+        }
+
+        let status_path = ChunkedMmapVectors::<VectorElementType>::status_file(dir.path());
+
+        // Simulate a legacy BE-native status file written by an older BE build.
+        fs::write(status_path.clone(), (vector_count as usize).to_ne_bytes()).unwrap();
+        assert_eq!(
+            fs::metadata(status_path.clone()).unwrap().len() as usize,
+            LEGACY_STATUS_FILE_SIZE
+        );
+
+        let reopened: ChunkedMmapVectors<VectorElementType> =
+            ChunkedMmapVectors::open(dir.path(), dim, AdviceSetting::Global, Some(true)).unwrap();
+        assert_eq!(reopened.len(), vector_count as usize);
+
+        let raw_status = fs::read(status_path).unwrap();
+        assert_eq!(raw_status.len(), STATUS_FILE_SIZE);
+        assert_eq!(&raw_status[..STATUS_MAGIC_END], &STATUS_MAGIC);
+        let mut version_raw = [0u8; 4];
+        version_raw.copy_from_slice(&raw_status[STATUS_VERSION_OFFSET..STATUS_LEN_OFFSET]);
+        assert_eq!(u32::from_le_bytes(version_raw), STATUS_VERSION);
+        let mut len_raw = [0u8; 8];
+        len_raw.copy_from_slice(&raw_status[STATUS_LEN_OFFSET..STATUS_FILE_SIZE]);
+        assert_eq!(u64::from_le_bytes(len_raw), vector_count as u64);
+    }
+
+    #[test]
+    fn test_chunked_mmap_rejects_invalid_status_magic() {
+        let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
+        let dim = 32;
+        let hw_counter = HardwareCounterCell::new();
+
+        {
+            let mut storage: ChunkedMmapVectors<VectorElementType> =
+                ChunkedMmapVectors::open(dir.path(), dim, AdviceSetting::Global, Some(true))
+                    .unwrap();
+            storage.push(&vec![0.0; dim], &hw_counter).unwrap();
+            storage.flusher()().unwrap();
+        }
+
+        let mut status = [0u8; STATUS_FILE_SIZE];
+        initialize_status_bytes(&mut status, 1).unwrap();
+        status[..STATUS_MAGIC_END].copy_from_slice(b"nope");
+
+        let status_path = ChunkedMmapVectors::<VectorElementType>::status_file(dir.path());
+        fs::write(status_path, status).unwrap();
+
+        let err = ChunkedMmapVectors::<VectorElementType>::open(
+            dir.path(),
+            dim,
+            AdviceSetting::Global,
+            Some(true),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Invalid chunked mmap status magic")
+        );
+    }
+
+    #[test]
+    fn test_chunked_mmap_rejects_unsupported_status_version() {
+        let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
+        let dim = 32;
+
+        let mut status = [0u8; STATUS_FILE_SIZE];
+        initialize_status_bytes(&mut status, 0).unwrap();
+        status[STATUS_VERSION_OFFSET..STATUS_LEN_OFFSET]
+            .copy_from_slice(&(STATUS_VERSION + 1).to_le_bytes());
+
+        let status_path = ChunkedMmapVectors::<VectorElementType>::status_file(dir.path());
+        fs::write(status_path, status).unwrap();
+
+        let err = ChunkedMmapVectors::<VectorElementType>::open(
+            dir.path(),
+            dim,
+            AdviceSetting::Global,
+            Some(true),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Unsupported chunked mmap status version")
+        );
+    }
+
+    #[test]
+    fn test_chunked_mmap_rejects_unexpected_status_size() {
+        let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
+        let dim = 32;
+
+        let status_path = ChunkedMmapVectors::<VectorElementType>::status_file(dir.path());
+        fs::write(status_path, [1u8; 7]).unwrap();
+
+        let err = ChunkedMmapVectors::<VectorElementType>::open(
+            dir.path(),
+            dim,
+            AdviceSetting::Global,
+            Some(true),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Unexpected chunked mmap status size")
+        );
+    }
+
+    #[test]
     fn test_chunked_mmap_rejects_status_len_beyond_chunk_capacity() {
         let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
         let dim = 32;
@@ -707,6 +831,54 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("Invalid chunked mmap status len"));
+    }
+
+    #[test]
+    #[cfg(target_endian = "little")]
+    fn test_chunked_mmap_open_does_not_decode_chunks_on_le() {
+        let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
+        let dim = 2;
+        let hw_counter = HardwareCounterCell::new();
+
+        {
+            let mut storage: ChunkedMmapVectors<VectorElementType> =
+                ChunkedMmapVectors::open(dir.path(), dim, AdviceSetting::Global, Some(true))
+                    .unwrap();
+            storage.push(&[1.0, -2.5], &hw_counter).unwrap();
+            storage.flusher()().unwrap();
+        }
+
+        let reopened: ChunkedMmapVectors<VectorElementType> =
+            ChunkedMmapVectors::open(dir.path(), dim, AdviceSetting::Global, Some(true)).unwrap();
+        assert!(reopened.decoded_chunks.is_none());
+        assert_eq!(
+            reopened.get::<crate::vector_storage::Random>(0).unwrap(),
+            &[1.0, -2.5]
+        );
+    }
+
+    #[test]
+    #[cfg(target_endian = "big")]
+    fn test_chunked_mmap_open_decodes_chunks_on_be() {
+        let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
+        let dim = 2;
+        let hw_counter = HardwareCounterCell::new();
+
+        {
+            let mut storage: ChunkedMmapVectors<VectorElementType> =
+                ChunkedMmapVectors::open(dir.path(), dim, AdviceSetting::Global, Some(true))
+                    .unwrap();
+            storage.push(&[1.0, -2.5], &hw_counter).unwrap();
+            storage.flusher()().unwrap();
+        }
+
+        let reopened: ChunkedMmapVectors<VectorElementType> =
+            ChunkedMmapVectors::open(dir.path(), dim, AdviceSetting::Global, Some(true)).unwrap();
+        assert!(reopened.decoded_chunks.is_some());
+        assert_eq!(
+            reopened.get::<crate::vector_storage::Random>(0).unwrap(),
+            &[1.0, -2.5]
+        );
     }
 
     #[test]
