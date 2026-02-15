@@ -16,6 +16,12 @@ use tikv_jemalloc_ctl::{epoch, stats};
 
 #[derive(Debug, Clone, Default, JsonSchema, Serialize, Anonymize)]
 #[anonymize(false)]
+/// Memory telemetry collected from the running process.
+///
+/// Notes on portability:
+/// - On Linux `x86_64`/`aarch64` builds (non-MSVC), values are sourced from jemalloc stats.
+/// - On other non-MSVC targets, `resident_bytes`/`retained_bytes` are best-effort from procfs
+///   (`/proc/self/status`), and allocator-internal breakdowns are reported as `0`.
 pub struct MemoryTelemetry {
     /// Total number of bytes in active pages allocated by the application
     pub active_bytes: usize,
