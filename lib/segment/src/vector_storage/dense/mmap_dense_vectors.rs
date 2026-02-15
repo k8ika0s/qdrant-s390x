@@ -403,6 +403,8 @@ fn deleted_mmap_size(num: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
+
     use fs_err as fs;
     use tempfile::Builder;
 
@@ -522,5 +524,33 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("Invalid mmap deleted file"));
+    }
+
+    #[test]
+    fn test_open_accepts_large_vectors_file() {
+        let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
+        let vectors_path = dir.path().join("data.mmap");
+        let deleted_path = dir.path().join("drop.mmap");
+
+        let dim = 16;
+        let num_vectors = 10_000usize;
+        let vector_bytes = dim * size_of::<VectorElementType>();
+        let total_size = HEADER_SIZE + num_vectors * vector_bytes;
+
+        let mut file = fs::File::create(&vectors_path).unwrap();
+        file.write_all(VECTORS_HEADER).unwrap();
+        file.set_len(total_size as u64).unwrap();
+
+        let opened = MmapDenseVectors::<VectorElementType>::open(
+            &vectors_path,
+            &deleted_path,
+            dim,
+            false,
+            AdviceSetting::Global,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(opened.num_vectors, num_vectors);
     }
 }
