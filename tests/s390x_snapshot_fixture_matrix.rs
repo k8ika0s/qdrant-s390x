@@ -66,8 +66,10 @@ fn s390x_snapshot_fixture_produce() {
     let base_url = format!("http://127.0.0.1:{http_port}");
     let log_path = tmp.path().join("qdrant.log");
 
+    // QEMU s390x runs can be significantly slower than native; keep timeouts generous
+    // to avoid flaking the cross-endian producer/consumer gates.
     let client = Client::builder()
-        .timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
         .build()
         .expect("build http client");
 
@@ -155,8 +157,10 @@ fn s390x_snapshot_fixture_consume() {
         )
     });
 
+    // QEMU s390x runs can be significantly slower than native; keep timeouts generous
+    // to avoid flaking the cross-endian producer/consumer gates.
     let client = Client::builder()
-        .timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
         .build()
         .expect("build http client");
 
