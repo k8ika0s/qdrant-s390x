@@ -15,7 +15,7 @@ use memory::mmap_type::{MmapBitSlice, MmapFlusher};
 use parking_lot::Mutex;
 
 use crate::common::error_logging::LogError;
-use crate::common::operation_error::OperationResult;
+use crate::common::operation_error::{OperationError, OperationResult};
 use crate::data_types::primitive::PrimitiveVectorElement;
 #[cfg(target_os = "linux")]
 use crate::vector_storage::async_io::UringReader;
@@ -79,8 +79,57 @@ impl<T: PrimitiveVectorElement + MmapEndianConvertible> MmapDenseVectors<T> {
         // Allocate/open vectors mmap
         ensure_mmap_file_size(vectors_path, VECTORS_HEADER, None)
             .describe("Create mmap data file")?;
+
+        // Validate file length before mmap: empty files can't be mmapped on some platforms, and
+        // short/partial headers must never underflow arithmetic below.
+        let vectors_len = std::fs::metadata(vectors_path)?.len() as usize;
+        if vectors_len < HEADER_SIZE {
+            return Err(OperationError::service_error(format!(
+                "Invalid mmap vectors file {} size {vectors_len}, expected at least {HEADER_SIZE}",
+                vectors_path.display(),
+            )));
+        }
+
         let mmap = mmap_ops::open_read_mmap(vectors_path, madvise, populate)
             .describe("Open mmap for reading")?;
+
+        if mmap.len() < HEADER_SIZE {
+            // Defensive check: if `mmap_ops` ever returns a smaller mapping than metadata
+            // reported, we must still fail safe.
+            return Err(OperationError::service_error(format!(
+                "Invalid mmap vectors file {} mapping size {}, expected at least {HEADER_SIZE}",
+                vectors_path.display(),
+                mmap.len(),
+            )));
+        }
+        if &mmap[..HEADER_SIZE] != VECTORS_HEADER {
+            return Err(OperationError::service_error(format!(
+                "Invalid mmap vectors file {} header, expected {:?}",
+                vectors_path.display(),
+                VECTORS_HEADER,
+            )));
+        }
+
+        let vector_bytes = dim.checked_mul(size_of::<T>()).ok_or_else(|| {
+            OperationError::service_error("Vector byte size overflow when opening mmap".to_string())
+        })?;
+        if vector_bytes == 0 {
+            return Err(OperationError::service_error(
+                "Vector byte size is zero when opening mmap".to_string(),
+            ));
+        }
+
+        let payload_len = mmap
+            .len()
+            .checked_sub(HEADER_SIZE)
+            .ok_or_else(|| OperationError::service_error("Vectors mmap size underflow".to_string()))?;
+        if payload_len % vector_bytes != 0 {
+            return Err(OperationError::service_error(format!(
+                "Invalid mmap vectors file {} size {}, expected header + N * {vector_bytes}",
+                vectors_path.display(),
+                mmap.len(),
+            )));
+        }
 
         // Only open second mmap for sequential reads if supported
         let mmap_seq = if *MULTI_MMAP_IS_SUPPORTED {
@@ -95,9 +144,9 @@ impl<T: PrimitiveVectorElement + MmapEndianConvertible> MmapDenseVectors<T> {
             None
         };
 
-        let num_vectors = (mmap.len() - HEADER_SIZE) / dim / size_of::<T>();
+        let num_vectors = payload_len / vector_bytes;
         let decoded_vectors = if cfg!(target_endian = "big") {
-            Some(Self::decode_vectors(&mmap, dim, num_vectors))
+            Some(Self::decode_vectors(&mmap, dim, num_vectors)?)
         } else {
             None
         };
@@ -108,6 +157,22 @@ impl<T: PrimitiveVectorElement + MmapEndianConvertible> MmapDenseVectors<T> {
             .describe("Create mmap deleted file")?;
         let deleted_mmap = mmap_ops::open_write_mmap(deleted_path, AdviceSetting::Global, false)
             .describe("Open mmap deleted for writing")?;
+
+        if deleted_mmap.len() < deleted_mmap_data_start() {
+            return Err(OperationError::service_error(format!(
+                "Invalid mmap deleted file {} size {}, expected at least {}",
+                deleted_path.display(),
+                deleted_mmap.len(),
+                deleted_mmap_data_start(),
+            )));
+        }
+        if &deleted_mmap[..HEADER_SIZE] != DELETED_HEADER {
+            return Err(OperationError::service_error(format!(
+                "Invalid mmap deleted file {} header, expected {:?}",
+                deleted_path.display(),
+                DELETED_HEADER,
+            )));
+        }
 
         // Advise kernel that we'll need this page soon so the kernel can prepare
         #[cfg(unix)]
@@ -141,15 +206,19 @@ impl<T: PrimitiveVectorElement + MmapEndianConvertible> MmapDenseVectors<T> {
     }
 
     #[inline]
-    fn decode_vectors(mmap: &Mmap, dim: usize, num_vectors: usize) -> Vec<T> {
-        let values_count = dim * num_vectors;
-        let values_size = values_count * size_of::<T>();
+    fn decode_vectors(mmap: &Mmap, dim: usize, num_vectors: usize) -> OperationResult<Vec<T>> {
+        let values_count = dim.checked_mul(num_vectors).ok_or_else(|| {
+            OperationError::service_error("mmap vectors values_count overflow".to_string())
+        })?;
+        let values_size = values_count.checked_mul(size_of::<T>()).ok_or_else(|| {
+            OperationError::service_error("mmap vectors values_size overflow".to_string())
+        })?;
         let byte_slice = &mmap[HEADER_SIZE..HEADER_SIZE + values_size];
         let stored = Self::typed_slice_from_bytes(byte_slice, values_count);
-        stored
+        Ok(stored
             .iter()
             .map(|value| T::from_le_storage(*value))
-            .collect()
+            .collect())
     }
 
     pub fn has_async_reader(&self) -> bool {
@@ -334,7 +403,11 @@ fn deleted_mmap_size(num: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use fs_err as fs;
+    use tempfile::Builder;
+
     use super::*;
+    use crate::data_types::vectors::VectorElementType;
 
     #[test]
     fn test_deleted_mmap_layout_is_fixed_width() {
@@ -343,5 +416,111 @@ mod tests {
         assert_eq!(deleted_mmap_size(1), 16);
         assert_eq!(deleted_mmap_size(64), 16);
         assert_eq!(deleted_mmap_size(65), 24);
+    }
+
+    #[test]
+    fn test_open_rejects_partial_vectors_header() {
+        let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
+        let vectors_path = dir.path().join("data.mmap");
+        let deleted_path = dir.path().join("drop.mmap");
+
+        fs::write(&vectors_path, &b"da"[..]).unwrap();
+
+        let err = MmapDenseVectors::<VectorElementType>::open(
+            &vectors_path,
+            &deleted_path,
+            2,
+            false,
+            AdviceSetting::Global,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Invalid mmap vectors file"));
+    }
+
+    #[test]
+    fn test_open_rejects_vectors_header_mismatch() {
+        let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
+        let vectors_path = dir.path().join("data.mmap");
+        let deleted_path = dir.path().join("drop.mmap");
+
+        fs::write(&vectors_path, &b"nope"[..]).unwrap();
+
+        let err = MmapDenseVectors::<VectorElementType>::open(
+            &vectors_path,
+            &deleted_path,
+            2,
+            false,
+            AdviceSetting::Global,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Invalid mmap vectors file"));
+    }
+
+    #[test]
+    fn test_open_rejects_truncated_vectors_payload() {
+        let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
+        let vectors_path = dir.path().join("data.mmap");
+        let deleted_path = dir.path().join("drop.mmap");
+
+        // dim=2, f32 => vector_bytes=8. Provide only 4 bytes payload (half vector).
+        let mut raw = Vec::new();
+        raw.extend_from_slice(VECTORS_HEADER);
+        raw.extend_from_slice(&1.0f32.to_le_bytes());
+        fs::write(&vectors_path, raw).unwrap();
+
+        let err = MmapDenseVectors::<VectorElementType>::open(
+            &vectors_path,
+            &deleted_path,
+            2,
+            false,
+            AdviceSetting::Global,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("expected header + N"));
+    }
+
+    #[test]
+    fn test_open_accepts_header_only_vectors_file() {
+        let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
+        let vectors_path = dir.path().join("data.mmap");
+        let deleted_path = dir.path().join("drop.mmap");
+
+        fs::write(&vectors_path, VECTORS_HEADER).unwrap();
+
+        let opened = MmapDenseVectors::<VectorElementType>::open(
+            &vectors_path,
+            &deleted_path,
+            2,
+            false,
+            AdviceSetting::Global,
+            false,
+        )
+        .unwrap();
+        assert_eq!(opened.num_vectors, 0);
+        assert_eq!(opened.deleted_count, 0);
+    }
+
+    #[test]
+    fn test_open_rejects_deleted_header_mismatch() {
+        let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
+        let vectors_path = dir.path().join("data.mmap");
+        let deleted_path = dir.path().join("drop.mmap");
+
+        fs::write(&vectors_path, VECTORS_HEADER).unwrap();
+        fs::write(&deleted_path, &b"nope"[..]).unwrap();
+
+        let err = MmapDenseVectors::<VectorElementType>::open(
+            &vectors_path,
+            &deleted_path,
+            2,
+            false,
+            AdviceSetting::Global,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Invalid mmap deleted file"));
     }
 }
