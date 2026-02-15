@@ -16,9 +16,9 @@ for file in "$@"; do
     continue
   fi
 
-  if rg -n 'to_ne_bytes\\(|from_ne_bytes\\(' "$file" >/dev/null; then
+  if rg -n 'to_ne_bytes\(|from_ne_bytes\(' "$file" >/dev/null; then
     echo "error: native-endian byte conversion in $file"
-    rg -n 'to_ne_bytes\\(|from_ne_bytes\\(' "$file"
+    rg -n 'to_ne_bytes\(|from_ne_bytes\(' "$file"
     fail=1
   fi
 
