@@ -1,13 +1,9 @@
 use schemars::JsonSchema;
 use segment::common::anonymize::Anonymize;
 use serde::Serialize;
+use crate::common::auth::Auth;
 #[cfg(not(target_env = "msvc"))]
 use storage::rbac::AccessRequirements;
-#[cfg(all(
-    not(target_env = "msvc"),
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
-use storage::rbac::Auth;
 #[cfg(all(
     not(target_env = "msvc"),
     any(target_arch = "x86_64", target_arch = "aarch64")
@@ -36,6 +32,13 @@ pub struct MemoryTelemetry {
 }
 
 impl MemoryTelemetry {
+    #[cfg(any(
+        test,
+        all(
+            not(target_env = "msvc"),
+            not(any(target_arch = "x86_64", target_arch = "aarch64"))
+        )
+    ))]
     fn clamp_u64_to_usize(value: u64) -> usize {
         if value > usize::MAX as u64 {
             usize::MAX
@@ -44,6 +47,13 @@ impl MemoryTelemetry {
         }
     }
 
+    #[cfg(any(
+        test,
+        all(
+            not(target_env = "msvc"),
+            not(any(target_arch = "x86_64", target_arch = "aarch64"))
+        )
+    ))]
     fn parse_proc_self_status_kb(status: &str, key: &str) -> Option<u64> {
         // Expected format: `VmRSS:\t  1234 kB`
         for line in status.lines() {
@@ -61,6 +71,13 @@ impl MemoryTelemetry {
         None
     }
 
+    #[cfg(any(
+        test,
+        all(
+            not(target_env = "msvc"),
+            not(any(target_arch = "x86_64", target_arch = "aarch64"))
+        )
+    ))]
     fn parse_proc_self_status_bytes(status: &str) -> Option<(usize, usize)> {
         let rss_kb = Self::parse_proc_self_status_kb(status, "VmRSS:");
         let vmsize_kb = Self::parse_proc_self_status_kb(status, "VmSize:");
