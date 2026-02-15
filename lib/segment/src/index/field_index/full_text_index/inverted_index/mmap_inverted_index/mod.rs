@@ -898,3 +898,67 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write as _;
+
+    use super::{LegacyEndian, PointToTokensCount, POINT_TO_TOKENS_COUNT_HEADER_SIZE};
+
+    #[test]
+    fn test_point_to_tokens_count_migrates_legacy_le_and_be() {
+        fn write_legacy(path: &std::path::Path, endian: LegacyEndian, values: &[usize]) {
+            let mut f = std::fs::File::create(path).expect("create legacy file");
+            for &v in values {
+                match std::mem::size_of::<usize>() {
+                    8 => {
+                        let raw = v as u64;
+                        let bytes = match endian {
+                            LegacyEndian::Little => raw.to_le_bytes(),
+                            LegacyEndian::Big => raw.to_be_bytes(),
+                        };
+                        f.write_all(&bytes).expect("write legacy word");
+                    }
+                    4 => {
+                        let raw = v as u32;
+                        let bytes = match endian {
+                            LegacyEndian::Little => raw.to_le_bytes(),
+                            LegacyEndian::Big => raw.to_be_bytes(),
+                        };
+                        f.write_all(&bytes).expect("write legacy word");
+                    }
+                    other => panic!("unsupported usize size: {other}"),
+                }
+            }
+        }
+
+        let values: Vec<usize> = vec![0, 1, 5, 42, 255, 1024, 65_535];
+
+        for endian in [LegacyEndian::Little, LegacyEndian::Big] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("point_to_tokens_count.dat");
+
+            write_legacy(&path, endian, &values);
+
+            let opened = PointToTokensCount::open(&path, false).expect("open migrated");
+            assert_eq!(opened.len(), values.len());
+            for (i, &expected) in values.iter().enumerate() {
+                assert_eq!(opened.get(i), Some(expected));
+            }
+
+            let bytes = std::fs::read(&path).expect("read migrated file");
+            assert!(bytes.starts_with(b"pttc"), "missing new-format magic");
+            assert_eq!(
+                bytes.len(),
+                POINT_TO_TOKENS_COUNT_HEADER_SIZE + values.len() * std::mem::size_of::<u32>()
+            );
+
+            // Verify canonical u32 LE encoding on disk.
+            for (i, &expected) in values.iter().enumerate() {
+                let off = POINT_TO_TOKENS_COUNT_HEADER_SIZE + i * std::mem::size_of::<u32>();
+                let got = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
+                assert_eq!(got, expected);
+            }
+        }
+    }
+}
