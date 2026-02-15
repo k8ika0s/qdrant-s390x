@@ -288,11 +288,12 @@ impl Tracker {
         let header: &TrackerHeader =
             // TODO SAFETY
             unsafe { transmute_from_u8(&mmap[0..size_of::<TrackerHeader>()]) };
+        let next_pointer_offset = u32::from_le(header.next_pointer_offset);
         let pending_updates = AHashMap::new();
         Ok(Self {
-            next_pointer_offset: header.next_pointer_offset,
+            next_pointer_offset,
             path,
-            header: header.clone(),
+            header: TrackerHeader { next_pointer_offset },
             mmap,
             pending_updates,
         })
@@ -320,7 +321,7 @@ impl Tracker {
                 Some(new_pointer) => {
                     // Mark any existing pointer for removal to free its blocks
                     if let Some(Some(old_pointer)) = self.get_raw(point_offset) {
-                        old_pointers.push(*old_pointer);
+                        old_pointers.push(old_pointer);
                     }
 
                     self.persist_pointer(point_offset, Some(new_pointer));
@@ -377,22 +378,20 @@ impl Tracker {
 
     /// Write the current page header to the memory map
     fn write_header(&mut self) {
-        // Safety: TrackerHeader is a POD type.
-        #[expect(deprecated, reason = "legacy code")]
-        let header_bytes = unsafe { transmute_to_u8(&self.header) };
-        self.mmap[0..header_bytes.len()].copy_from_slice(header_bytes);
+        // Persist in canonical little-endian so the file is portable across endianness.
+        let le = self.header.next_pointer_offset.to_le_bytes();
+        self.mmap[0..le.len()].copy_from_slice(&le);
     }
 
     /// Save the mapping at the given offset
     /// The file is resized if necessary
     fn persist_pointer(&mut self, point_offset: PointOffset, pointer: Option<ValuePointer>) {
-        if pointer.is_none() && point_offset as usize >= self.mmap.len() {
-            return;
-        }
-
         let point_offset = point_offset as usize;
         let start_offset =
             size_of::<TrackerHeader>() + point_offset * size_of::<Optional<ValuePointer>>();
+        if pointer.is_none() && start_offset >= self.mmap.len() {
+            return;
+        }
         let end_offset = start_offset + size_of::<Optional<ValuePointer>>();
 
         // Grow tracker file if it isn't big enough
@@ -404,7 +403,12 @@ impl Tracker {
                 .unwrap();
         }
 
-        let pointer: Optional<_> = pointer.into();
+        let mut pointer: Optional<_> = pointer.into();
+        // Persist in canonical little-endian so the file is portable across endianness.
+        pointer.discriminant = pointer.discriminant.to_le();
+        pointer.value.page_id = pointer.value.page_id.to_le();
+        pointer.value.block_offset = pointer.value.block_offset.to_le();
+        pointer.value.length = pointer.value.length.to_le();
         // Safety: Optional<ValuePointer> is a POD type.
         #[expect(deprecated, reason = "legacy code")]
         self.mmap[start_offset..end_offset].copy_from_slice(unsafe { transmute_to_u8(&pointer) });
@@ -435,7 +439,7 @@ impl Tracker {
     }
 
     /// Get the raw value at the given point offset
-    fn get_raw(&self, point_offset: PointOffset) -> Option<Option<&ValuePointer>> {
+    fn get_raw(&self, point_offset: PointOffset) -> Option<Option<ValuePointer>> {
         let start_offset = size_of::<TrackerHeader>()
             + point_offset as usize * size_of::<Optional<ValuePointer>>();
         let end_offset = start_offset + size_of::<Optional<ValuePointer>>();
@@ -444,9 +448,16 @@ impl Tracker {
         }
         // Safety: Optional<ValuePointer> is a POD type.
         #[expect(deprecated, reason = "legacy code")]
-        let page_pointer: &Optional<_> =
+        let page_pointer: &Optional<ValuePointer> =
             unsafe { transmute_from_u8(&self.mmap[start_offset..end_offset]) };
-        Some(page_pointer.is_some())
+        match page_pointer.is_some() {
+            None => Some(None),
+            Some(raw) => Some(Some(ValuePointer {
+                page_id: u32::from_le(raw.page_id),
+                block_offset: u32::from_le(raw.block_offset),
+                length: u32::from_le(raw.length),
+            })),
+        }
     }
 
     /// Get the page pointer at the given point offset
@@ -455,12 +466,12 @@ impl Tracker {
             // Pending update exists but is empty, should not happen, fall back to real data
             Some(pending) if pending.is_empty() => {
                 debug_assert!(false, "pending updates must not be empty");
-                self.get_raw(point_offset).flatten().cloned()
+                self.get_raw(point_offset).flatten()
             }
             // Use set from pending updates
             Some(pending) => pending.current,
             // No pending update, use real data
-            None => self.get_raw(point_offset).flatten().cloned(),
+            None => self.get_raw(point_offset).flatten(),
         }
     }
 
@@ -582,13 +593,13 @@ mod tests {
         assert_eq!(tracker.mapping_len(), 4);
         assert_eq!(tracker.pointer_count(), 11); // accounts for empty slots
 
-        assert_eq!(tracker.get_raw(0), Some(Some(&ValuePointer::new(1, 1, 1))));
-        assert_eq!(tracker.get_raw(1), Some(Some(&ValuePointer::new(2, 2, 2))));
-        assert_eq!(tracker.get_raw(2), Some(Some(&ValuePointer::new(3, 3, 3))));
+        assert_eq!(tracker.get_raw(0), Some(Some(ValuePointer::new(1, 1, 1))));
+        assert_eq!(tracker.get_raw(1), Some(Some(ValuePointer::new(2, 2, 2))));
+        assert_eq!(tracker.get_raw(2), Some(Some(ValuePointer::new(3, 3, 3))));
         assert_eq!(tracker.get_raw(3), Some(None)); // intermediate empty slot
         assert_eq!(
             tracker.get_raw(10),
-            Some(Some(&ValuePointer::new(10, 10, 10)))
+            Some(Some(ValuePointer::new(10, 10, 10)))
         );
         assert_eq!(tracker.get_raw(100_000), None); // out of bounds
 
@@ -833,10 +844,14 @@ mod tests {
         ]);
         #[expect(deprecated, reason = "legacy code")]
         let some_val: &Optional<ValuePointer> = unsafe { transmute_from_u8(&some_data.0) };
-        // N.B. fails on a big-endian machine.
+        let decoded = some_val.is_some().map(|vp| ValuePointer {
+            page_id: u32::from_le(vp.page_id),
+            block_offset: u32::from_le(vp.block_offset),
+            length: u32::from_le(vp.length),
+        });
         assert_eq!(
-            some_val.is_some(),
-            Some(&ValuePointer {
+            decoded,
+            Some(ValuePointer {
                 page_id: 0x11223344,
                 block_offset: 0x55667788,
                 length: 0xAABBCCDD,
