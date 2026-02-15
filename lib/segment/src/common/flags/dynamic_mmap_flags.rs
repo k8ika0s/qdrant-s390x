@@ -10,7 +10,7 @@ use memmap2::MmapMut;
 use memory::fadvise::clear_disk_cache;
 use memory::madvise::{self, AdviceSetting, Madviseable as _};
 use memory::mmap_ops::{create_and_ensure_length, open_write_mmap};
-use memory::mmap_type::{MmapBitSlice, MmapType};
+use memory::mmap_type::{MmapBitSlice, MmapFlusher, MmapType};
 
 use crate::common::Flusher;
 use crate::common::operation_error::{OperationError, OperationResult};
@@ -24,34 +24,243 @@ const FLAGS_FILE: &str = "flags_a.dat";
 const FLAGS_FILE_LEGACY: &str = "flags_b.dat";
 
 const STATUS_FILE_NAME: &str = "status.dat";
+const STATUS_MAGIC: [u8; 4] = *b"dmf1";
+const STATUS_VERSION: u32 = 1;
+const STATUS_FILE_SIZE: usize = 24;
+const STATUS_MAGIC_END: usize = 4;
+const STATUS_VERSION_OFFSET: usize = STATUS_MAGIC_END;
+const STATUS_LEN_OFFSET: usize = STATUS_VERSION_OFFSET + 4;
+const STATUS_CURRENT_FILE_ID_OFFSET: usize = STATUS_LEN_OFFSET + 8;
+const USIZE_BYTES: usize = std::mem::size_of::<usize>();
+const LEGACY_STATUS_FILE_SIZE: usize = USIZE_BYTES * 2;
 
 fn status_file(directory: &Path) -> PathBuf {
     directory.join(STATUS_FILE_NAME)
 }
 
-#[repr(C)]
-struct DynamicMmapStatus {
-    /// Amount of flags (bits)
+#[derive(Debug)]
+struct StatusFile {
+    mmap: MmapType<[u8; STATUS_FILE_SIZE]>,
     len: usize,
-
-    /// Should be 0 in the current version.  Old versions used it to indicate which flags file
-    /// (flags_a.dat or flags_b.dat) is currently in use.
-    current_file_id: usize,
+    current_file_id: u8,
 }
 
-fn ensure_status_file(directory: &Path) -> OperationResult<MmapMut> {
-    let status_file = status_file(directory);
-    if !status_file.exists() {
-        let length = std::mem::size_of::<DynamicMmapStatus>();
-        create_and_ensure_length(&status_file, length)?;
+impl StatusFile {
+    fn open(directory: &Path) -> OperationResult<Self> {
+        let status_file = status_file(directory);
+        if !status_file.exists() {
+            create_and_ensure_length(&status_file, STATUS_FILE_SIZE)?;
+            let mmap = open_write_mmap(&status_file, AdviceSetting::Global, false)?;
+            let mut mmap = unsafe { MmapType::try_from(mmap)? };
+            initialize_status_bytes(&mut mmap, 0, 0)?;
+            return Ok(Self {
+                mmap,
+                len: 0,
+                current_file_id: 0,
+            });
+        }
+
+        let file_len = fs::metadata(&status_file)?.len() as usize;
+        if file_len == STATUS_FILE_SIZE {
+            let mmap = open_write_mmap(&status_file, AdviceSetting::Global, false)?;
+            let mmap = unsafe { MmapType::try_from(mmap)? };
+            let (len, current_file_id) = parse_status(&mmap)?;
+            return Ok(Self {
+                mmap,
+                len,
+                current_file_id,
+            });
+        }
+
+        if file_len == LEGACY_STATUS_FILE_SIZE {
+            let legacy_raw = fs::read(&status_file)?;
+            let (len, current_file_id) = decode_legacy_status(&legacy_raw, directory)?;
+            create_and_ensure_length(&status_file, STATUS_FILE_SIZE)?;
+            let mmap = open_write_mmap(&status_file, AdviceSetting::Global, false)?;
+            let mut mmap = unsafe { MmapType::try_from(mmap)? };
+            initialize_status_bytes(&mut mmap, len, current_file_id)?;
+            return Ok(Self {
+                mmap,
+                len,
+                current_file_id,
+            });
+        }
+
+        Err(OperationError::service_error(format!(
+            "Unexpected dynamic mmap status size {}, expected {} or {}",
+            file_len, STATUS_FILE_SIZE, LEGACY_STATUS_FILE_SIZE
+        )))
     }
-    Ok(open_write_mmap(&status_file, AdviceSetting::Global, false)?)
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    fn current_file_id(&self) -> u8 {
+        self.current_file_id
+    }
+
+    #[inline]
+    fn set_len(&mut self, len: usize) -> OperationResult<()> {
+        write_status_len(&mut self.mmap, len)?;
+        self.len = len;
+        Ok(())
+    }
+
+    #[inline]
+    fn set_current_file_id(&mut self, id: u8) -> OperationResult<()> {
+        write_status_current_file_id(&mut self.mmap, id)?;
+        self.current_file_id = id;
+        Ok(())
+    }
+
+    #[inline]
+    fn flusher(&self) -> MmapFlusher {
+        self.mmap.flusher()
+    }
+}
+
+fn initialize_status_bytes(
+    status: &mut [u8; STATUS_FILE_SIZE],
+    len: usize,
+    current_file_id: u8,
+) -> OperationResult<()> {
+    status[..STATUS_MAGIC_END].copy_from_slice(&STATUS_MAGIC);
+    status[STATUS_VERSION_OFFSET..STATUS_LEN_OFFSET].copy_from_slice(&STATUS_VERSION.to_le_bytes());
+    write_status_len(status, len)?;
+    write_status_current_file_id(status, current_file_id)?;
+    Ok(())
+}
+
+fn write_status_len(status: &mut [u8; STATUS_FILE_SIZE], len: usize) -> OperationResult<()> {
+    let len = u64::try_from(len).map_err(|_| {
+        OperationError::service_error(format!(
+            "Dynamic mmap status len {len} does not fit into u64",
+        ))
+    })?;
+    status[STATUS_LEN_OFFSET..STATUS_CURRENT_FILE_ID_OFFSET].copy_from_slice(&len.to_le_bytes());
+    Ok(())
+}
+
+fn write_status_current_file_id(
+    status: &mut [u8; STATUS_FILE_SIZE],
+    current_file_id: u8,
+) -> OperationResult<()> {
+    let id = u64::from(current_file_id);
+    status[STATUS_CURRENT_FILE_ID_OFFSET..STATUS_FILE_SIZE].copy_from_slice(&id.to_le_bytes());
+    Ok(())
+}
+
+fn parse_status(status: &[u8; STATUS_FILE_SIZE]) -> OperationResult<(usize, u8)> {
+    if status[..STATUS_MAGIC_END] != STATUS_MAGIC {
+        return Err(OperationError::service_error(
+            "Invalid dynamic mmap status magic".to_string(),
+        ));
+    }
+
+    let mut version_raw = [0u8; 4];
+    version_raw.copy_from_slice(&status[STATUS_VERSION_OFFSET..STATUS_LEN_OFFSET]);
+    let version = u32::from_le_bytes(version_raw);
+    if version != STATUS_VERSION {
+        return Err(OperationError::service_error(format!(
+            "Unsupported dynamic mmap status version {version}",
+        )));
+    }
+
+    let mut len_raw = [0u8; 8];
+    len_raw.copy_from_slice(&status[STATUS_LEN_OFFSET..STATUS_CURRENT_FILE_ID_OFFSET]);
+    let len = u64::from_le_bytes(len_raw);
+    let len = usize::try_from(len).map_err(|_| {
+        OperationError::service_error(format!(
+            "Dynamic mmap status len {len} does not fit into usize",
+        ))
+    })?;
+
+    let mut id_raw = [0u8; 8];
+    id_raw.copy_from_slice(&status[STATUS_CURRENT_FILE_ID_OFFSET..STATUS_FILE_SIZE]);
+    let id = u64::from_le_bytes(id_raw);
+    let id: u8 = id.try_into().map_err(|_| {
+        OperationError::service_error(format!(
+            "Dynamic mmap status current_file_id {id} does not fit into u8",
+        ))
+    })?;
+
+    if id > 1 {
+        return Err(OperationError::service_error(format!(
+            "Invalid dynamic mmap current_file_id {id}",
+        )));
+    }
+
+    Ok((len, id))
+}
+
+fn decode_legacy_status(legacy_raw: &[u8], directory: &Path) -> OperationResult<(usize, u8)> {
+    if legacy_raw.len() != LEGACY_STATUS_FILE_SIZE {
+        return Err(OperationError::service_error(format!(
+            "Invalid legacy dynamic mmap status size {}, expected {}",
+            legacy_raw.len(),
+            LEGACY_STATUS_FILE_SIZE
+        )));
+    }
+
+    let (len_part, id_part) = legacy_raw.split_at(USIZE_BYTES);
+    let mut len_raw = [0u8; USIZE_BYTES];
+    let mut id_raw = [0u8; USIZE_BYTES];
+    len_raw.copy_from_slice(len_part);
+    id_raw.copy_from_slice(id_part);
+
+    // Prefer canonical LE decode to support migrating existing LE segments onto BE hosts.
+    let le_len = usize::from_le_bytes(len_raw);
+    let le_id = usize::from_le_bytes(id_raw);
+    if legacy_status_is_plausible(le_len, le_id, directory)? {
+        return Ok((le_len, le_id as u8));
+    }
+
+    let native_len = usize::from_ne_bytes(len_raw);
+    let native_id = usize::from_ne_bytes(id_raw);
+    if legacy_status_is_plausible(native_len, native_id, directory)? {
+        return Ok((native_len, native_id as u8));
+    }
+
+    Err(OperationError::service_error(format!(
+        "Invalid legacy dynamic mmap status (le_len={le_len}, le_id={le_id}, native_len={native_len}, native_id={native_id})",
+    )))
+}
+
+fn legacy_status_is_plausible(len: usize, current_file_id: usize, directory: &Path) -> OperationResult<bool> {
+    if current_file_id > 1 {
+        return Ok(false);
+    }
+
+    // Legacy status indicates which file is currently in use. Verify `len` fits the existing flags file.
+    let flags_path = if current_file_id == 0 {
+        directory.join(FLAGS_FILE)
+    } else {
+        directory.join(FLAGS_FILE_LEGACY)
+    };
+
+    let Ok(meta) = fs::metadata(&flags_path) else {
+        // Without an existing flags file, we cannot validate persisted len safely.
+        return Ok(len == 0);
+    };
+
+    let bytes = meta.len();
+    let Some(capacity_bits) = bytes.checked_mul(u64::from(u8::BITS)) else {
+        return Ok(false);
+    };
+    let Ok(capacity_bits) = usize::try_from(capacity_bits) else {
+        return Ok(false);
+    };
+
+    Ok(len <= capacity_bits)
 }
 
 pub struct DynamicMmapFlags {
     /// Current mmap'ed BitSlice for flags
     flags: MmapBitSlice,
-    status: MmapType<DynamicMmapStatus>,
+    status: StatusFile,
     directory: PathBuf,
 }
 
@@ -80,30 +289,29 @@ fn mmap_max_current_size(len: usize) -> usize {
 
 impl DynamicMmapFlags {
     pub fn len(&self) -> usize {
-        self.status.len
+        self.status.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.status.len == 0
+        self.status.len() == 0
     }
 
     pub fn open(directory: &Path, populate: bool) -> OperationResult<Self> {
         fs::create_dir_all(directory)?;
-        let status_mmap = ensure_status_file(directory)?;
-        let mut status: MmapType<DynamicMmapStatus> = unsafe { MmapType::try_from(status_mmap)? };
+        let mut status = StatusFile::open(directory)?;
 
-        if status.current_file_id != 0 {
+        if status.current_file_id() != 0 {
             // Migrate
             fs::copy(
                 directory.join(FLAGS_FILE_LEGACY),
                 directory.join(FLAGS_FILE),
             )?;
-            status.current_file_id = 0;
+            status.set_current_file_id(0)?;
             status.flusher()()?;
         }
 
         // Open first mmap
-        let flags = Self::open_mmap(status.len, directory, populate)?;
+        let flags = Self::open_mmap(status.len(), directory, populate)?;
         Ok(Self {
             flags,
             status,
@@ -151,20 +359,20 @@ impl DynamicMmapFlags {
     ///
     /// Errors if the vector is shrunk.
     pub fn set_len(&mut self, new_len: usize) -> OperationResult<()> {
-        debug_assert!(new_len >= self.status.len);
-        if new_len == self.status.len {
+        debug_assert!(new_len >= self.status.len());
+        if new_len == self.status.len() {
             return Ok(());
         }
 
-        if new_len < self.status.len {
+        if new_len < self.status.len() {
             return Err(OperationError::service_error(format!(
                 "Cannot shrink the mmap flags from {} to {new_len}",
-                self.status.len,
+                self.status.len(),
             )));
         }
 
         // Capacity can be up to 2x the current length
-        let current_capacity = mmap_max_current_size(self.status.len);
+        let current_capacity = mmap_max_current_size(self.status.len());
 
         if new_len > current_capacity {
             // Flush the current mmaps before resizing
@@ -178,7 +386,7 @@ impl DynamicMmapFlags {
             self.flags = flags;
         }
 
-        self.status.len = new_len;
+        self.status.set_len(new_len)?;
         Ok(())
     }
 
@@ -333,7 +541,7 @@ mod tests {
 
         {
             let dynamic_flags = DynamicMmapFlags::open(dir.path(), true).unwrap();
-            assert_eq!(dynamic_flags.status.len, num_flags * 2);
+            assert_eq!(dynamic_flags.len(), num_flags * 2);
             for (i, flag) in random_flags.iter().enumerate() {
                 assert_eq!(dynamic_flags.get(i), *flag);
                 assert_eq!(dynamic_flags.get(num_flags + i), !*flag);
@@ -380,5 +588,40 @@ mod tests {
         assert_eq!(mmap_capacity_bytes(1024), 128);
         assert_eq!(mmap_capacity_bytes(1025), 256);
         assert_eq!(mmap_capacity_bytes(10000), 2048);
+    }
+
+    #[test]
+    fn test_migrates_legacy_status_file_encoded_as_le() {
+        let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
+
+        // Create initial files (flags_a.dat + status.dat).
+        {
+            let mut dynamic_flags = DynamicMmapFlags::open(dir.path(), false).unwrap();
+            dynamic_flags.set_len(1000).unwrap();
+            dynamic_flags.flusher()().unwrap();
+        }
+
+        // Overwrite status.dat with legacy native-usize persistence, encoded as little-endian.
+        let legacy_len: usize = 1000;
+        let legacy_id: usize = 0;
+        let mut legacy_raw = Vec::new();
+        legacy_raw.extend_from_slice(&legacy_len.to_le_bytes());
+        legacy_raw.extend_from_slice(&legacy_id.to_le_bytes());
+        assert_eq!(legacy_raw.len(), LEGACY_STATUS_FILE_SIZE);
+        fs::write(status_file(dir.path()), &legacy_raw).unwrap();
+
+        // Re-open: should migrate legacy status to the new canonical format and preserve length.
+        let reopened = DynamicMmapFlags::open(dir.path(), false).unwrap();
+        assert_eq!(reopened.len(), legacy_len);
+
+        let raw_status = fs::read(status_file(dir.path())).unwrap();
+        assert_eq!(raw_status.len(), STATUS_FILE_SIZE);
+        assert_eq!(&raw_status[..STATUS_MAGIC_END], &STATUS_MAGIC);
+        let mut version_raw = [0u8; 4];
+        version_raw.copy_from_slice(&raw_status[STATUS_VERSION_OFFSET..STATUS_LEN_OFFSET]);
+        assert_eq!(u32::from_le_bytes(version_raw), STATUS_VERSION);
+        let mut len_raw = [0u8; 8];
+        len_raw.copy_from_slice(&raw_status[STATUS_LEN_OFFSET..STATUS_CURRENT_FILE_ID_OFFSET]);
+        assert_eq!(u64::from_le_bytes(len_raw), legacy_len as u64);
     }
 }
