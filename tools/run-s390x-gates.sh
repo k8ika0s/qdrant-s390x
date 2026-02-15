@@ -57,5 +57,8 @@ stage segment_endian cargo test -p segment endian --locked
 # Compile qdrant tests without running (stressful link stage on small hosts).
 stage qdrant_norun cargo test -p qdrant --features rocksdb --locked --no-run
 
+# End-to-end HTTP smoke test (ignored by default; run explicitly here).
+stage qdrant_http_smoke cargo test -p qdrant --features rocksdb --locked --test s390x_http_smoke -- --ignored
+
 echo
 echo "All stages completed successfully."
