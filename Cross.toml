@@ -1,0 +1,7 @@
+[target.s390x-unknown-linux-gnu]
+# cross images don't ship with `protoc`, but Qdrant's `api` crate generates gRPC code at build
+# time. Install it once per runner/image so `cross test` can build `qdrant` in the s390x lane.
+pre-build = [
+  "export DEBIAN_FRONTEND=noninteractive && apt-get update && apt-get install --assume-yes protobuf-compiler && rm -rf /var/lib/apt/lists/*",
+]
+
