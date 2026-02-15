@@ -387,4 +387,29 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_routing_is_stable_across_architectures() {
+        // Regression guard: routing must not depend on host endianness/architecture.
+        // The ring is built on `StableHash` (canonical little-endian) + SipHasher24.
+        let mut ring = HashRing::fair(100);
+        ring.add(1);
+        ring.add(2);
+        ring.add(3);
+        ring.add(4);
+
+        let keys: Vec<u32> = (0u32..50u32).collect();
+        let got: Vec<u32> = keys
+            .iter()
+            .map(|k| *ring.get(k).expect("key must map to a shard"))
+            .collect();
+
+        // 0..50 routing table for the above ring. Any change here is a compatibility break for
+        // routing and must be explicitly justified (and ideally called out in release notes).
+        let expected: [u32; 50] = [
+            1, 3, 3, 4, 4, 2, 4, 4, 1, 2, 2, 3, 3, 4, 1, 1, 3, 4, 3, 3, 3, 4, 1, 4, 1, 3,
+            4, 4, 2, 3, 2, 3, 3, 4, 2, 4, 3, 2, 4, 4, 2, 4, 4, 2, 1, 4, 2, 3, 3, 4,
+        ];
+        assert_eq!(got, expected);
+    }
 }
