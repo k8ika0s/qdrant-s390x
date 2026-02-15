@@ -8,7 +8,14 @@
 //!
 //! By default, fixtures are written under `dev-docs/s390x-fixtures/<arch>_<endian>_<unix_ts>/`.
 //! Override via `S390X_FIXTURES_DIR=/path/to/dir`.
+//!
+//! Note: Snapshot fixtures are stored gzipped (`*.snapshot.gz`) to avoid committing or transferring
+//! large preallocated WAL/mmap files. The consumer inflates each fixture into a temp directory
+//! before calling the Qdrant snapshot recovery API.
 
+use flate2::Compression;
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -87,8 +94,8 @@ fn s390x_snapshot_fixture_produce() {
     http_search_multivec_and_assert(&client, &base_url, multivec, &log_path);
     let multivec_snapshot =
         http_create_collection_snapshot(&client, &base_url, multivec, &snapshots_path, &log_path);
-    let multivec_snapshot_name = "multivec.snapshot";
-    copy_fixture(&multivec_snapshot, &out_dir, multivec_snapshot_name);
+    let multivec_snapshot_name = "multivec.snapshot.gz";
+    gzip_fixture(&multivec_snapshot, &out_dir, multivec_snapshot_name);
     fixtures.push(SnapshotFixtureEntry {
         id: "multivec".to_string(),
         collection: multivec.to_string(),
@@ -103,8 +110,8 @@ fn s390x_snapshot_fixture_produce() {
     http_scroll_sparse_and_assert_sorted(&client, &base_url, sparse, &log_path);
     let sparse_snapshot =
         http_create_collection_snapshot(&client, &base_url, sparse, &snapshots_path, &log_path);
-    let sparse_snapshot_name = "sparse.snapshot";
-    copy_fixture(&sparse_snapshot, &out_dir, sparse_snapshot_name);
+    let sparse_snapshot_name = "sparse.snapshot.gz";
+    gzip_fixture(&sparse_snapshot, &out_dir, sparse_snapshot_name);
     fixtures.push(SnapshotFixtureEntry {
         id: "sparse".to_string(),
         collection: sparse.to_string(),
@@ -178,13 +185,15 @@ fn s390x_snapshot_fixture_consume() {
         .expect("spawn qdrant");
         wait_ready(&client, &base_url, &log_path);
 
-        let snapshot_path = in_dir.join(&entry.snapshot_file);
-        if !snapshot_path.exists() {
+        let source_fixture = in_dir.join(&entry.snapshot_file);
+        if !source_fixture.exists() {
             panic!(
                 "missing fixture snapshot: {}",
-                snapshot_path.display()
+                source_fixture.display()
             );
         }
+
+        let snapshot_path = materialize_snapshot_fixture(&source_fixture, tmp.path());
 
         http_delete_collection_if_exists(&client, &base_url, &entry.collection, &log_path);
         http_recover_collection_from_snapshot(
@@ -252,19 +261,61 @@ fn fixtures_dir_from_env_or_default() -> PathBuf {
     ))
 }
 
-fn copy_fixture(snapshot_path: &Path, out_dir: &Path, out_name: &str) {
+fn gzip_fixture(snapshot_path: &Path, out_dir: &Path, out_name: &str) {
     let out_path = out_dir.join(out_name);
-    fs::copy(snapshot_path, &out_path).unwrap_or_else(|e| {
+    let input = File::open(snapshot_path).unwrap_or_else(|e| {
         panic!(
-            "copy fixture failed: {e}\nfrom={}\nto={}",
-            snapshot_path.display(),
-            out_path.display()
+            "open snapshot for gzip failed: {e} ({})",
+            snapshot_path.display()
         )
     });
+    let output = File::create(&out_path)
+        .unwrap_or_else(|e| panic!("create gz fixture failed: {e} ({})", out_path.display()));
+
+    let mut encoder = GzEncoder::new(output, Compression::default());
+    let mut input = std::io::BufReader::new(input);
+    std::io::copy(&mut input, &mut encoder).expect("gzip copy");
+    encoder.finish().expect("finish gzip");
+
+    let size = fs::metadata(&out_path).expect("stat gz fixture").len();
+    assert!(size > 0, "gz fixture is empty: {}", out_path.display());
+}
+
+fn materialize_snapshot_fixture(source_fixture: &Path, tmp_dir: &Path) -> PathBuf {
+    let file_name = source_fixture
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_else(|| panic!("invalid fixture filename: {}", source_fixture.display()));
+
+    if file_name.ends_with(".snapshot") {
+        return source_fixture.to_path_buf();
+    }
+
+    if !file_name.ends_with(".snapshot.gz") {
+        panic!("unsupported fixture type: {}", source_fixture.display());
+    }
+
+    let out_name = file_name.trim_end_matches(".gz");
+    let out_path = tmp_dir.join(out_name);
+
+    let input = File::open(source_fixture)
+        .unwrap_or_else(|e| panic!("open gz fixture failed: {e} ({})", source_fixture.display()));
+    let mut decoder = GzDecoder::new(std::io::BufReader::new(input));
+    let output = File::create(&out_path)
+        .unwrap_or_else(|e| panic!("create inflated fixture failed: {e} ({})", out_path.display()));
+    let mut output = std::io::BufWriter::new(output);
+    std::io::copy(&mut decoder, &mut output).expect("inflate gzip");
+
     let size = fs::metadata(&out_path)
-        .expect("stat copied fixture")
+        .expect("stat inflated fixture")
         .len();
-    assert!(size > 0, "fixture snapshot is empty: {}", out_path.display());
+    assert!(
+        size > 0,
+        "inflated fixture is empty: {}",
+        out_path.display()
+    );
+
+    out_path
 }
 
 fn pick_unused_port() -> u16 {
@@ -774,4 +825,3 @@ fn tail_log(path: &Path) -> String {
         format!("--- qdrant log (tail) ---\n{s}")
     }
 }
-
