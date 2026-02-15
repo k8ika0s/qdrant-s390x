@@ -711,4 +711,30 @@ mod tests {
         let err = DynamicMmapFlags::open(dir.path(), false).unwrap_err();
         assert!(format!("{err}").contains("Invalid legacy dynamic mmap status"));
     }
+
+    #[cfg(target_endian = "big")]
+    #[test]
+    fn test_endian_migrates_legacy_le_status_on_be() {
+        let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
+
+        // Create initial files (flags_a.dat + status.dat) with a known capacity.
+        {
+            let mut dynamic_flags = DynamicMmapFlags::open(dir.path(), false).unwrap();
+            dynamic_flags.set_len(8).unwrap();
+            dynamic_flags.flusher()().unwrap();
+        }
+
+        // Simulate a legacy status.dat written on a LE machine.
+        let legacy_len: usize = 8;
+        let legacy_id: usize = 0;
+        let mut legacy_raw = Vec::new();
+        legacy_raw.extend_from_slice(&legacy_len.to_le_bytes());
+        legacy_raw.extend_from_slice(&legacy_id.to_le_bytes());
+        assert_eq!(legacy_raw.len(), LEGACY_STATUS_FILE_SIZE);
+        fs::write(status_file(dir.path()), &legacy_raw).unwrap();
+
+        // Re-open: should decode legacy LE bytes (not native BE) and migrate to canonical format.
+        let reopened = DynamicMmapFlags::open(dir.path(), false).unwrap();
+        assert_eq!(reopened.len(), legacy_len);
+    }
 }
