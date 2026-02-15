@@ -624,4 +624,91 @@ mod tests {
         len_raw.copy_from_slice(&raw_status[STATUS_LEN_OFFSET..STATUS_CURRENT_FILE_ID_OFFSET]);
         assert_eq!(u64::from_le_bytes(len_raw), legacy_len as u64);
     }
+
+    #[test]
+    fn test_rejects_canonical_status_with_invalid_magic() {
+        let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
+
+        // Create initial files (flags_a.dat + status.dat).
+        {
+            let dynamic_flags = DynamicMmapFlags::open(dir.path(), false).unwrap();
+            assert_eq!(dynamic_flags.len(), 0);
+        }
+
+        let status_path = status_file(dir.path());
+        let mut raw_status = fs::read(&status_path).unwrap();
+        assert_eq!(raw_status.len(), STATUS_FILE_SIZE);
+        raw_status[..STATUS_MAGIC_END].copy_from_slice(b"nope");
+        fs::write(&status_path, &raw_status).unwrap();
+
+        let err = DynamicMmapFlags::open(dir.path(), false).unwrap_err();
+        assert!(format!("{err}").contains("Invalid dynamic mmap status magic"));
+    }
+
+    #[test]
+    fn test_rejects_canonical_status_with_unsupported_version() {
+        let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
+
+        // Create initial files (flags_a.dat + status.dat).
+        {
+            let mut dynamic_flags = DynamicMmapFlags::open(dir.path(), false).unwrap();
+            dynamic_flags.set_len(10).unwrap();
+            dynamic_flags.flusher()().unwrap();
+        }
+
+        let status_path = status_file(dir.path());
+        let mut raw_status = fs::read(&status_path).unwrap();
+        assert_eq!(raw_status.len(), STATUS_FILE_SIZE);
+        raw_status[STATUS_VERSION_OFFSET..STATUS_LEN_OFFSET].copy_from_slice(&2u32.to_le_bytes());
+        fs::write(&status_path, &raw_status).unwrap();
+
+        let err = DynamicMmapFlags::open(dir.path(), false).unwrap_err();
+        assert!(format!("{err}").contains("Unsupported dynamic mmap status version"));
+    }
+
+    #[test]
+    fn test_rejects_legacy_status_with_invalid_id() {
+        let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
+
+        // Create initial files (flags_a.dat + status.dat).
+        {
+            let mut dynamic_flags = DynamicMmapFlags::open(dir.path(), false).unwrap();
+            dynamic_flags.set_len(1000).unwrap();
+            dynamic_flags.flusher()().unwrap();
+        }
+
+        let legacy_len: usize = 1000;
+        let legacy_id: usize = 2;
+        let mut legacy_raw = Vec::new();
+        legacy_raw.extend_from_slice(&legacy_len.to_le_bytes());
+        legacy_raw.extend_from_slice(&legacy_id.to_le_bytes());
+        assert_eq!(legacy_raw.len(), LEGACY_STATUS_FILE_SIZE);
+        fs::write(status_file(dir.path()), &legacy_raw).unwrap();
+
+        let err = DynamicMmapFlags::open(dir.path(), false).unwrap_err();
+        assert!(format!("{err}").contains("Invalid legacy dynamic mmap status"));
+    }
+
+    #[test]
+    fn test_rejects_legacy_status_with_len_exceeding_flags_capacity() {
+        let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
+
+        // Create initial files (flags_a.dat + status.dat) with a small capacity.
+        {
+            let mut dynamic_flags = DynamicMmapFlags::open(dir.path(), false).unwrap();
+            dynamic_flags.set_len(1000).unwrap();
+            dynamic_flags.flusher()().unwrap();
+        }
+
+        let legacy_len: usize = 10_000;
+        let legacy_id: usize = 0;
+        let mut legacy_raw = Vec::new();
+        legacy_raw.extend_from_slice(&legacy_len.to_le_bytes());
+        legacy_raw.extend_from_slice(&legacy_id.to_le_bytes());
+        assert_eq!(legacy_raw.len(), LEGACY_STATUS_FILE_SIZE);
+        fs::write(status_file(dir.path()), &legacy_raw).unwrap();
+
+        let err = DynamicMmapFlags::open(dir.path(), false).unwrap_err();
+        assert!(format!("{err}").contains("Invalid legacy dynamic mmap status"));
+    }
 }
