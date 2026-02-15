@@ -60,5 +60,8 @@ stage qdrant_norun cargo test -p qdrant --features rocksdb --locked --no-run
 # End-to-end HTTP smoke test (ignored by default; run explicitly here).
 stage qdrant_http_smoke cargo test -p qdrant --features rocksdb --locked --test s390x_http_smoke -- --ignored
 
+# End-to-end snapshot create/restore smoke test (ignored by default; run explicitly here).
+stage qdrant_snapshot_smoke cargo test -p qdrant --features rocksdb --locked --test s390x_snapshot_smoke -- --ignored
+
 echo
 echo "All stages completed successfully."
