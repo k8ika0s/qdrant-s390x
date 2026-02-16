@@ -59,6 +59,7 @@ stage common_stable_hash cargo test -p common stable_hash --locked
 stage collection_routing cargo test -p collection --locked test_routing_is_stable_across_architectures
 stage quantization cargo test -p quantization --locked
 stage segment_endian cargo test -p segment endian --locked
+stage segment_mmap_point_to_values cargo test -p segment --locked mmap_point_to_values
 
 # Compile qdrant tests without running (stressful link stage on small hosts).
 stage qdrant_norun cargo test -p qdrant --features rocksdb --locked --no-run
