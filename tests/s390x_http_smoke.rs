@@ -100,6 +100,14 @@ fn wait_ready(client: &Client, base_url: &str, log_path: &Path) {
     }
 }
 
+fn hit_id_u64(hit: &serde_json::Value) -> Option<u64> {
+    let id = hit.get("id")?;
+    if let Some(n) = id.as_u64() {
+        return Some(n);
+    }
+    id.get("num").and_then(|n| n.as_u64())
+}
+
 fn http_delete_collection_if_exists(client: &Client, base_url: &str, collection: &str, log_path: &Path) {
     let resp = client
         .delete(format!("{base_url}/collections/{collection}"))
@@ -188,6 +196,16 @@ fn http_search_and_assert(client: &Client, base_url: &str, collection: &str, log
     assert!(
         !hits.is_empty(),
         "expected at least one search hit\nresponse={v}\n{}",
+        tail_log(log_path)
+    );
+
+    // Deterministic dataset: point 1 should rank first for this query.
+    let top_id = hit_id_u64(&hits[0]).unwrap_or_else(|| {
+        panic!("search response hit missing numeric id: {}\n{}", hits[0], tail_log(log_path))
+    });
+    assert_eq!(
+        top_id, 1,
+        "unexpected top hit id; response={v}\n{}",
         tail_log(log_path)
     );
 }

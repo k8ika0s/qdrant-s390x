@@ -381,6 +381,15 @@ fn wait_ready(client: &Client, base_url: &str, log_path: &Path) {
     }
 }
 
+fn hit_id_u64(hit: &serde_json::Value) -> Option<u64> {
+    let id = hit.get("id")?;
+    if let Some(n) = id.as_u64() {
+        return Some(n);
+    }
+    // Some API shapes wrap the numeric id.
+    id.get("num").and_then(|n| n.as_u64())
+}
+
 fn http_delete_collection_if_exists(
     client: &Client,
     base_url: &str,
@@ -563,6 +572,20 @@ fn http_search_multivec_and_assert(
         "expected at least one search hit\nresponse={v}\n{}",
         tail_log(log_path)
     );
+
+    // Deterministic dataset: the highest-id point should rank first.
+    let top_id = hit_id_u64(&hits[0]).unwrap_or_else(|| {
+        panic!(
+            "search response hit missing numeric id: {}\n{}",
+            hits[0],
+            tail_log(log_path)
+        )
+    });
+    assert_eq!(
+        top_id, 8,
+        "unexpected top hit id; response={v}\n{}",
+        tail_log(log_path)
+    );
 }
 
 fn http_create_binary_quant_collection(
@@ -700,6 +723,20 @@ fn http_search_binary_quant_and_assert(
     assert!(
         !hits.is_empty(),
         "expected at least one search hit\nresponse={v}\n{}",
+        tail_log(log_path)
+    );
+
+    // Deterministic dataset: the highest-id point should rank first.
+    let top_id = hit_id_u64(&hits[0]).unwrap_or_else(|| {
+        panic!(
+            "search response hit missing numeric id: {}\n{}",
+            hits[0],
+            tail_log(log_path)
+        )
+    });
+    assert_eq!(
+        top_id, 8,
+        "unexpected top hit id; response={v}\n{}",
         tail_log(log_path)
     );
 }
