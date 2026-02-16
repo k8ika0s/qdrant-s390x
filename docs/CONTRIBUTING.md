@@ -46,6 +46,19 @@ When a PR touches persistence, low-level memory layout, or architecture-specific
 5. Include architecture-tagged validation evidence (CI logs and/or native host logs) in the PR
    description.
 
+### Multi-Arch Safety Checklist
+
+When a PR touches persistence, low-level memory layout, or architecture-specific fast paths:
+
+1. Keep behavior unchanged on existing `x86_64`/`aarch64` paths unless the PR explicitly targets
+   them.
+2. Use explicit byte order for persisted numeric fields (`to_le_bytes`/`from_le_bytes` or
+   equivalent wrappers), never native-endian helpers for on-disk contracts.
+3. Avoid persisted `usize`/`isize`; use fixed-width types for serialized metadata.
+4. Add/refresh compatibility tests (legacy-read, malformed-input, and cross-endian where relevant).
+5. Include architecture-tagged validation evidence (CI logs and/or native host logs) in the PR
+   description.
+
 ## Any contributions you make will be under the Apache License 2.0
 In short, when you submit code changes, your submissions are understood to be under the same [Apache License 2.0](https://choosealicense.com/licenses/apache-2.0/) that covers the project. Feel free to contact the maintainers if that's a concern.
 
