@@ -78,5 +78,11 @@ else
   echo "# stage=qdrant_snapshot_fixture_matrix skipped (set S390X_FIXTURES_DIR to enable)"
 fi
 
+if [[ -n "${S390X_CONTAINER_SMOKE:-}" ]]; then
+  stage container_smoke tools/s390x-container-smoke.sh
+else
+  echo "# stage=container_smoke skipped (set S390X_CONTAINER_SMOKE=1 to enable)"
+fi
+
 echo
 echo "All stages completed successfully."
