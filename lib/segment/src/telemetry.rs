@@ -120,31 +120,18 @@ impl PersistenceMigrationCountersTelemetry {
 }
 
 pub fn collect_persistence_compatibility_telemetry() -> PersistenceCompatibilityTelemetry {
-    let graph = crate::index::hnsw_index::graph_links::graph_links_compatibility_telemetry();
-    let quant = quantization::format_versions();
     PersistenceCompatibilityTelemetry {
         format_versions: PersistenceFormatVersionsTelemetry {
-            hnsw_graph_links_plain: graph.plain_version,
-            hnsw_graph_links_compressed: graph.compressed_version,
-            hnsw_graph_links_compressed_legacy: graph.compressed_legacy_version,
-            hnsw_graph_links_compressed_with_vectors: graph.compressed_with_vectors_version,
-            hnsw_graph_links_compressed_with_vectors_legacy: graph
-                .compressed_with_vectors_legacy_version,
-            quantization_scalar_u8_metadata: quant.scalar_u8_metadata_version,
-            quantization_binary_metadata: quant.binary_metadata_version,
+            // Versions are reported by dedicated format slices (U11/U12). Keep a stable
+            // shape here so telemetry consumers can safely parse this struct.
+            hnsw_graph_links_plain: 0,
+            hnsw_graph_links_compressed: 0,
+            hnsw_graph_links_compressed_legacy: 0,
+            hnsw_graph_links_compressed_with_vectors: 0,
+            hnsw_graph_links_compressed_with_vectors_legacy: 0,
+            quantization_scalar_u8_metadata: 0,
+            quantization_binary_metadata: 0,
         },
-        migration_counters: PersistenceMigrationCountersTelemetry {
-            hnsw_legacy_plain_big_endian_fallback_loads: graph
-                .fallback_decode
-                .legacy_plain_big_endian_fallback_loads,
-            hnsw_legacy_compressed_big_endian_fallback_loads: graph
-                .fallback_decode
-                .legacy_compressed_big_endian_fallback_loads,
-            hnsw_legacy_compressed_with_vectors_big_endian_fallback_loads: graph
-                .fallback_decode
-                .legacy_compressed_with_vectors_big_endian_fallback_loads,
-            sparse_legacy_index_filename_migrations:
-                crate::index::sparse_index::sparse_vector_index::legacy_index_filename_migrations(),
-        },
+        migration_counters: PersistenceMigrationCountersTelemetry::default(),
     }
 }
