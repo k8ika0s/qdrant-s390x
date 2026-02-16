@@ -201,7 +201,12 @@ impl SegmentBuilder {
                 FieldIndex::IntMapIndex(index) => {
                     if let Some(numbers) = index.get_values(internal_id) {
                         for number in numbers {
-                            ordering = ordering.wrapping_add(*number as u64);
+                            #[cfg(target_endian = "little")]
+                            let n = *number;
+                            #[cfg(target_endian = "big")]
+                            let n = number;
+
+                            ordering = ordering.wrapping_add(n as u64);
                         }
                     }
                     break;
@@ -252,7 +257,10 @@ impl SegmentBuilder {
                 }
                 FieldIndex::UuidMapIndex(index) => {
                     if let Some(ids) = index.get_values(internal_id) {
+                        #[cfg(target_endian = "little")]
                         uuid_hash(&mut ordering, ids.copied());
+                        #[cfg(target_endian = "big")]
+                        uuid_hash(&mut ordering, ids);
                     }
                     break;
                 }
