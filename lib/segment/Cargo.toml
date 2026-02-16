@@ -144,10 +144,6 @@ name = "hnsw_search_graph"
 harness = false
 
 [[bench]]
-name = "hnsw_persistence_smoke"
-harness = false
-
-[[bench]]
 name = "chunked_mmap_vectors_smoke"
 harness = false
 
