@@ -5,6 +5,7 @@ use common::flags::FeatureFlags;
 use common::types::{DetailsLevel, TelemetryDetail};
 use schemars::JsonSchema;
 use segment::common::anonymize::Anonymize;
+use segment::telemetry::PersistenceCompatibilityTelemetry;
 use segment::types::HnswGlobalConfig;
 use serde::Serialize;
 
@@ -38,6 +39,8 @@ pub struct RunningEnvironmentTelemetry {
     distribution: Option<String>,
     #[anonymize(false)]
     distribution_version: Option<String>,
+    #[anonymize(false)]
+    arch: String,
     is_docker: bool,
     #[anonymize(false)]
     cores: Option<usize>,
@@ -47,6 +50,8 @@ pub struct RunningEnvironmentTelemetry {
     cpu_flags: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     cpu_endian: Option<CpuEndian>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    persistence_compat: Option<PersistenceCompatibilityTelemetry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     gpu_devices: Option<Vec<GpuDeviceTelemetry>>,
 }
@@ -172,12 +177,14 @@ fn get_system_data() -> RunningEnvironmentTelemetry {
     RunningEnvironmentTelemetry {
         distribution,
         distribution_version,
+        arch: std::env::consts::ARCH.to_string(),
         is_docker: cfg!(unix) && Path::new("/.dockerenv").exists(),
         cores: sys_info::cpu_num().ok().map(|x| x as usize),
         ram_size: sys_info::mem_info().ok().map(|x| x.total as usize),
         disk_size: sys_info::disk_info().ok().map(|x| x.total as usize),
         cpu_flags: cpu_flags.join(","),
         cpu_endian: Some(CpuEndian::current()),
+        persistence_compat: Some(segment::telemetry::collect_persistence_compatibility_telemetry()),
         gpu_devices,
     }
 }
