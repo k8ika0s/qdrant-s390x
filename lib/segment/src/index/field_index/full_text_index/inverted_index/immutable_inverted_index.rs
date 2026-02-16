@@ -465,7 +465,7 @@ impl From<&MmapInvertedIndex> for ImmutableInvertedIndex {
 
         let vocab: HashMap<String, TokenId> = index
             .iter_vocab()
-            .map(|(token_str, token_id)| (token_str.to_owned(), token_id))
+            .map(|(token_str, token_id)| (token_str.to_owned(), *token_id))
             .collect();
 
         debug_assert!(
