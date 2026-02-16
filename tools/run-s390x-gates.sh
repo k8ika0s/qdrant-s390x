@@ -56,6 +56,7 @@ stage workspace_build_tests cargo build --workspace --features rocksdb --tests -
 
 # High-signal, fast unit test slices.
 stage common_stable_hash cargo test -p common stable_hash --locked
+stage common_mmap_hashmap cargo test -p common mmap_hashmap --locked
 stage collection_routing cargo test -p collection --locked test_routing_is_stable_across_architectures
 stage quantization cargo test -p quantization --locked
 stage segment_endian cargo test -p segment endian --locked

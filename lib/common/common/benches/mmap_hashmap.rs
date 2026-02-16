@@ -23,9 +23,11 @@ fn bench_mmap_hashmap(c: &mut Criterion) {
     let mut it = keys.iter().cycle();
     c.bench_function("get", |b| {
         b.iter(|| {
-            mmap.get(it.next().unwrap())
-                .iter()
-                .flat_map(|v| v.iter().copied().map(u32::from_le))
+            mmap.get_stored(it.next().unwrap())
+                .ok()
+                .flatten()
+                .into_iter()
+                .flat_map(|v| v.iter_native())
                 .max()
         })
     });

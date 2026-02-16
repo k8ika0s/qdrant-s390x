@@ -266,7 +266,7 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
             .payload_index_io_read_counter()
             .incr_delta(READ_ENTRY_OVERHEAD);
 
-        match self.storage.value_to_points.get(value) {
+        match self.storage.value_to_points.get_stored(value) {
             Ok(Some(points)) => Some(points.len()),
             Ok(None) => None,
             Err(err) => {
