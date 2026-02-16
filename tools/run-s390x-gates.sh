@@ -18,7 +18,7 @@ mkdir -p "$OUT_DIR"
 ts="$(date -u +%Y%m%dT%H%M%SZ)"
 arch="$(uname -m 2>/dev/null || echo unknown)"
 endian="$(
-  rustc --print cfg 2>/dev/null | grep '^target_endian=' | head -n 1 | cut -d'\"' -f2 || true
+  rustc --print cfg 2>/dev/null | grep '^target_endian=' | head -n 1 | cut -d'"' -f2 || true
 )"
 endian="${endian:-unknown}"
 
