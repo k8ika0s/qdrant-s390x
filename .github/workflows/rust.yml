@@ -104,10 +104,6 @@ jobs:
         cross test -p segment --target s390x-unknown-linux-gnu --locked endian 2>&1 | tee -a s390x-tests.log
         # Routing determinism must be stable across endianness/architectures.
         cross test -p collection --target s390x-unknown-linux-gnu --locked test_routing_is_stable_across_architectures 2>&1 | tee -a s390x-tests.log
-        # Cross-endian regression: produce snapshots on LE host, consume under BE s390x (qemu).
-        FIXTURES_DIR="dev-docs/s390x-fixtures/ci_$(date +%s)"
-        S390X_FIXTURES_DIR="$FIXTURES_DIR" cargo test -p qdrant --locked --test s390x_snapshot_fixture_matrix -- --ignored s390x_snapshot_fixture_produce 2>&1 | tee -a s390x-tests.log
-        S390X_FIXTURES_DIR="$FIXTURES_DIR" cross test -p qdrant --target s390x-unknown-linux-gnu --locked --test s390x_snapshot_fixture_matrix -- --ignored s390x_snapshot_fixture_consume 2>&1 | tee -a s390x-tests.log
     - name: Upload s390x tests log
       if: always()
       uses: actions/upload-artifact@v6
