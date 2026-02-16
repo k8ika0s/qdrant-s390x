@@ -31,8 +31,8 @@ impl FacetParams {
 #[derive(Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub enum FacetValueRef<'a> {
     Keyword(&'a str),
-    Int(&'a IntPayloadType),
-    Uuid(&'a u128),
+    Int(IntPayloadType),
+    Uuid(UuidIntType),
     Bool(bool),
 }
 
@@ -40,8 +40,8 @@ impl FacetValueRef<'_> {
     pub fn to_owned(&self) -> FacetValue {
         match self {
             FacetValueRef::Keyword(s) => FacetValue::Keyword((*s).to_string()),
-            FacetValueRef::Int(i) => FacetValue::Int(**i),
-            FacetValueRef::Uuid(uuid) => FacetValue::Uuid(**uuid),
+            FacetValueRef::Int(i) => FacetValue::Int(*i),
+            FacetValueRef::Uuid(uuid) => FacetValue::Uuid(*uuid),
             FacetValueRef::Bool(b) => FacetValue::Bool(*b),
         }
     }
@@ -55,12 +55,24 @@ impl<'a> From<&'a str> for FacetValueRef<'a> {
 
 impl<'a> From<&'a IntPayloadType> for FacetValueRef<'a> {
     fn from(i: &'a IntPayloadType) -> Self {
-        FacetValueRef::Int(i)
+        FacetValueRef::Int(*i)
     }
 }
 
 impl<'a> From<&'a UuidIntType> for FacetValueRef<'a> {
     fn from(uuid: &'a UuidIntType) -> Self {
+        FacetValueRef::Uuid(*uuid)
+    }
+}
+
+impl<'a> From<IntPayloadType> for FacetValueRef<'a> {
+    fn from(i: IntPayloadType) -> Self {
+        FacetValueRef::Int(i)
+    }
+}
+
+impl<'a> From<UuidIntType> for FacetValueRef<'a> {
+    fn from(uuid: UuidIntType) -> Self {
         FacetValueRef::Uuid(uuid)
     }
 }

@@ -122,7 +122,13 @@ fn indexed_variable_retriever(index: &FieldIndex) -> Option<VariableRetrieverFn<
                     .get_values(point_id)
                     .into_iter()
                     .flatten()
-                    .map(|v| Value::Number(Number::from(*v)))
+                    .map(|v| {
+                        #[cfg(target_endian = "little")]
+                        let v = *v;
+                        #[cfg(target_endian = "big")]
+                        let v = v;
+                        Value::Number(Number::from(v))
+                    })
                     .collect()
             };
             Some(Box::new(extract_fn))
@@ -190,7 +196,13 @@ fn indexed_variable_retriever(index: &FieldIndex) -> Option<VariableRetrieverFn<
                     .get_values(point_id)
                     .into_iter()
                     .flatten()
-                    .map(|value| Value::String(UuidPayloadType::from_u128(*value).to_string()))
+                    .map(|value| {
+                        #[cfg(target_endian = "little")]
+                        let value = *value;
+                        #[cfg(target_endian = "big")]
+                        let value = value;
+                        Value::String(UuidPayloadType::from_u128(value).to_string())
+                    })
                     .collect()
             };
             Some(Box::new(extract_fn))
