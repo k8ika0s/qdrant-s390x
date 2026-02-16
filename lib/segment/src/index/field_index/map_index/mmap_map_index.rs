@@ -283,18 +283,16 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
     pub fn get_iterator(&self, value: &N, hw_counter: &HardwareCounterCell) -> IdIter<'_> {
         let hw_counter = self.make_conditioned_counter(hw_counter);
 
-        match self.storage.value_to_points.get(value) {
+        match self.storage.value_to_points.get_stored(value) {
             Ok(Some(slice)) => {
                 // We're iterating over the whole (mmapped) slice
                 hw_counter
                     .payload_index_io_read_counter()
-                    .incr_delta(size_of_val(slice) + READ_ENTRY_OVERHEAD);
+                    .incr_delta(std::mem::size_of_val(slice.as_stored()) + READ_ENTRY_OVERHEAD);
 
                 Box::new(
                     slice
-                        .iter()
-                        .copied()
-                        .map(PointOffsetType::from_le)
+                        .iter_native()
                         .filter(|idx| !self.storage.deleted.get(*idx as usize).unwrap_or(false)),
                 )
             }
@@ -321,11 +319,9 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
     }
 
     pub fn iter_counts_per_value(&self) -> impl Iterator<Item = (&N, usize)> + '_ {
-        self.storage.value_to_points.iter().map(|(k, v)| {
+        self.storage.value_to_points.iter_stored().map(|(k, v)| {
             let count = v
-                .iter()
-                .copied()
-                .map(PointOffsetType::from_le)
+                .iter_native()
                 .filter(|idx| !self.storage.deleted.get(*idx as usize).unwrap_or(true))
                 .unique()
                 .count();
@@ -339,7 +335,7 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
     ) -> impl Iterator<Item = (&'a N, IdIter<'a>)> + 'a {
         let hw_counter = self.make_conditioned_counter(hw_counter);
 
-        self.storage.value_to_points.iter().map(move |(k, v)| {
+        self.storage.value_to_points.iter_stored().map(move |(k, v)| {
             hw_counter
                 .payload_index_io_read_counter()
                 .incr_delta(k.write_bytes());
@@ -347,9 +343,7 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
             (
                 k,
                 Box::new(
-                    v.iter()
-                        .copied()
-                        .map(PointOffsetType::from_le)
+                    v.iter_native()
                         .filter(|idx| !self.storage.deleted.get(*idx as usize).unwrap_or(true))
                         .measure_hw_with_acc(
                             hw_counter.new_accumulator(),

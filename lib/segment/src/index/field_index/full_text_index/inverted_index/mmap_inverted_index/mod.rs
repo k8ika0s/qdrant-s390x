@@ -455,12 +455,10 @@ impl MmapInvertedIndex {
 
     pub(super) fn iter_vocab(&self) -> impl Iterator<Item = (&str, TokenId)> + '_ {
         // unwrap safety: we know that each token points to a token id.
-        self.storage.vocab.iter().filter_map(|(k, v)| {
-            v.first()
-                .copied()
-                .map(TokenId::from_le)
-                .map(|token_id| (k, token_id))
-        })
+        self.storage
+            .vocab
+            .iter_stored()
+            .filter_map(|(k, v)| v.iter_native().next().map(|token_id| (k, token_id)))
     }
 
     /// Returns whether the point id is valid and active.
