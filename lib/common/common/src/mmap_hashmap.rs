@@ -17,6 +17,7 @@ use ph::fmph::Function;
 use rand::Rng as _;
 #[cfg(any(test, feature = "testing"))]
 use rand::rngs::StdRng;
+use zerocopy::little_endian::{U32 as LeU32, U64 as LeU64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::zeros::WriteZerosExt as _;
@@ -25,20 +26,65 @@ type ValuesLen = u32;
 
 #[doc(hidden)]
 pub trait PersistLe: Copy {
+    type Native: Copy;
+
     fn to_le(self) -> Self;
+    fn from_le(self) -> Self::Native;
 }
 
 impl PersistLe for u32 {
+    type Native = u32;
+
     #[inline(always)]
     fn to_le(self) -> Self {
         u32::to_le(self)
     }
+
+    #[inline(always)]
+    fn from_le(self) -> Self::Native {
+        u32::from_le(self)
+    }
 }
 
 impl PersistLe for u64 {
+    type Native = u64;
+
     #[inline(always)]
     fn to_le(self) -> Self {
         u64::to_le(self)
+    }
+
+    #[inline(always)]
+    fn from_le(self) -> Self::Native {
+        u64::from_le(self)
+    }
+}
+
+impl PersistLe for LeU32 {
+    type Native = u32;
+
+    #[inline(always)]
+    fn to_le(self) -> Self {
+        self
+    }
+
+    #[inline(always)]
+    fn from_le(self) -> Self::Native {
+        self.get()
+    }
+}
+
+impl PersistLe for LeU64 {
+    type Native = u64;
+
+    #[inline(always)]
+    fn to_le(self) -> Self {
+        self
+    }
+
+    #[inline(always)]
+    fn from_le(self) -> Self::Native {
+        self.get()
     }
 }
 
@@ -110,6 +156,33 @@ const SIZE_OF_KEY: usize = size_of::<u64>();
 pub const READ_ENTRY_OVERHEAD: usize = SIZE_OF_LENGTH_FIELD + SIZE_OF_KEY + BUCKET_OFFSET_OVERHEAD;
 
 type BucketOffset = u64;
+
+#[derive(Clone, Copy, Debug)]
+pub struct StoredValues<'a, V: PersistLe> {
+    stored: &'a [V],
+}
+
+impl<'a, V: PersistLe> StoredValues<'a, V> {
+    #[inline]
+    pub fn as_stored(&self) -> &'a [V] {
+        self.stored
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.stored.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.stored.is_empty()
+    }
+
+    #[inline]
+    pub fn iter_native(self) -> impl ExactSizeIterator<Item = V::Native> + DoubleEndedIterator + 'a {
+        self.stored.iter().copied().map(PersistLe::from_le)
+    }
+}
 
 impl<K: Key + ?Sized, V: Sized + PersistLe + FromBytes + Immutable + IntoBytes + KnownLayout>
     MmapHashMap<K, V>
@@ -309,6 +382,11 @@ impl<K: Key + ?Sized, V: Sized + PersistLe + FromBytes + Immutable + IntoBytes +
         EntriesIter { map: self, idx: 0 }
     }
 
+    pub fn iter_stored(&self) -> impl Iterator<Item = (&K, StoredValues<'_, V>)> + '_ {
+        self.iter()
+            .map(|(k, v)| (k, StoredValues { stored: v }))
+    }
+
     /// Get the values associated with the `key`.
     pub fn get(&self, key: &K) -> io::Result<Option<&[V]>> {
         let Some(hash) = self.phf.get(key) else {
@@ -322,6 +400,10 @@ impl<K: Key + ?Sized, V: Sized + PersistLe + FromBytes + Immutable + IntoBytes +
         }
 
         Ok(Some(Self::get_values_from_entry(entry, key)?))
+    }
+
+    pub fn get_stored(&self, key: &K) -> io::Result<Option<StoredValues<'_, V>>> {
+        Ok(self.get(key)?.map(|v| StoredValues { stored: v }))
     }
 
     fn get_values_from_entry<'a>(entry: &'a [u8], key: &K) -> io::Result<&'a [V]> {
@@ -743,7 +825,9 @@ mod tests {
         assert_eq!(mmap.keys().count(), map.len());
 
         for (k, v) in mmap.iter() {
-            let v = v.iter().copied().map(u32::from_le).collect::<BTreeSet<_>>();
+            let v = StoredValues { stored: v }
+                .iter_native()
+                .collect::<BTreeSet<_>>();
             assert_eq!(map.get(&from_ref(k)).unwrap(), &v);
         }
 
@@ -754,12 +838,10 @@ mod tests {
         for (k, v) in map {
             let expected = v.into_iter().collect::<Vec<_>>();
             assert_eq!(
-                mmap.get(as_ref(&k))
+                mmap.get_stored(as_ref(&k))
                     .unwrap()
                     .unwrap()
-                    .iter()
-                    .copied()
-                    .map(u32::from_le)
+                    .iter_native()
                     .collect::<Vec<_>>(),
                 expected
             );

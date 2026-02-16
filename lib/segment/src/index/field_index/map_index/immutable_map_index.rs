@@ -141,10 +141,10 @@ where
     pub(super) fn open_mmap(index: MmapMapIndex<N>) -> Self {
         // Construct intermediate values to points map from backing storage
         let mapping = || {
-            index.storage.value_to_points.iter().map(|(value, ids)| {
+            index.storage.value_to_points.iter_stored().map(|(value, ids)| {
                 (
                     value,
-                    ids.iter().copied().filter(|idx| {
+                    ids.iter_native().filter(|idx| {
                         let is_deleted = index.storage.deleted.get(*idx as usize).unwrap_or(false);
                         !is_deleted
                     }),
