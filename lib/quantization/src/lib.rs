@@ -16,6 +16,19 @@ pub use encoded_vectors::{DistanceType, EncodedVectors, VectorParameters};
 pub use encoded_vectors_pq::{EncodedQueryPQ, EncodedVectorsPQ};
 pub use encoded_vectors_u8::{EncodedQueryU8, EncodedVectorsU8};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuantizationFormatVersions {
+    pub scalar_u8_metadata_version: u32,
+    pub binary_metadata_version: u32,
+}
+
+pub fn format_versions() -> QuantizationFormatVersions {
+    QuantizationFormatVersions {
+        scalar_u8_metadata_version: encoded_vectors_u8::metadata_format_version(),
+        binary_metadata_version: encoded_vectors_binary::metadata_format_version(),
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum EncodingError {
     IOError(String),

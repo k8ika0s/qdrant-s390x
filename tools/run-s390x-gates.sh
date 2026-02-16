@@ -84,5 +84,11 @@ else
   echo "# stage=container_smoke skipped (set S390X_CONTAINER_SMOKE=1 to enable)"
 fi
 
+if [[ -n "${S390X_PERF_SMOKE:-}" ]]; then
+  stage perf_smoke tools/s390x-perf-smoke.sh "$OUT_DIR"
+else
+  echo "# stage=perf_smoke skipped (set S390X_PERF_SMOKE=1 to enable)"
+fi
+
 echo
 echo "All stages completed successfully."

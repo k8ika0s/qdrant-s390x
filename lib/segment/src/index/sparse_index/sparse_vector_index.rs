@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use atomic_refcell::AtomicRefCell;
 use common::counter::hardware_counter::HardwareCounterCell;
@@ -40,6 +40,12 @@ use crate::vector_storage::{Random, VectorStorage, VectorStorageEnum, check_dele
 
 /// Whether to use the new compressed format.
 pub const USE_COMPRESSED: bool = true;
+
+static LEGACY_INDEX_FILENAME_MIGRATIONS: AtomicU64 = AtomicU64::new(0);
+
+pub fn legacy_index_filename_migrations() -> u64 {
+    LEGACY_INDEX_FILENAME_MIGRATIONS.load(Ordering::Relaxed)
+}
 
 #[derive(Debug)]
 pub struct SparseVectorIndex<TInvertedIndex: InvertedIndex> {
@@ -175,6 +181,12 @@ impl<TInvertedIndex: InvertedIndex> SparseVectorIndex<TInvertedIndex> {
             // Didn't have a version file, but uses 0.1.0 index. Create a version file.
             fs::rename(old_path, path.join(INDEX_FILE_NAME))?;
             TInvertedIndex::Version::save(path)?;
+            let prev = LEGACY_INDEX_FILENAME_MIGRATIONS.fetch_add(1, Ordering::Relaxed);
+            if prev == 0 {
+                log::warn!(
+                    "Migrated sparse index legacy filename from {OLD_INDEX_FILE_NAME} to {INDEX_FILE_NAME}; segment is now on canonical versioned sparse index layout"
+                );
+            }
             stored_version = Some(TInvertedIndex::Version::current());
         }
 

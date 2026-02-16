@@ -25,6 +25,10 @@ use crate::{
 // v2+: encoded words persisted in canonical little-endian bytes.
 const METADATA_FORMAT_VERSION: u32 = 2;
 
+pub const fn metadata_format_version() -> u32 {
+    METADATA_FORMAT_VERSION
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StorageWordOrder {
     LegacyNative,

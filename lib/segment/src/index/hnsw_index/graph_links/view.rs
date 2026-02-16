@@ -3,10 +3,11 @@ use std::borrow::Cow;
 use std::iter::{Copied, Zip};
 use std::mem::size_of;
 use std::num::NonZero;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use common::bitpacking::packed_bits;
 use common::bitpacking_links::{
-    iterate_packed_links, packed_links_size, PackedLinksIterator, MIN_BITS_PER_VALUE,
+    MIN_BITS_PER_VALUE, PackedLinksIterator, iterate_packed_links, packed_links_size,
 };
 use common::bitpacking_ordered;
 use common::types::PointOffsetType;
@@ -15,14 +16,29 @@ use itertools::{Either, Itertools as _};
 use zerocopy::{FromBytes, Immutable};
 
 use super::header::{
-    HeaderCompressed, HeaderPlain, HEADER_VERSION_COMPRESSED, HEADER_VERSION_COMPRESSED_LEGACY,
+    HEADER_VERSION_COMPRESSED, HEADER_VERSION_COMPRESSED_LEGACY,
     HEADER_VERSION_COMPRESSED_WITH_VECTORS, HEADER_VERSION_COMPRESSED_WITH_VECTORS_LEGACY,
-    HEADER_VERSION_PLAIN,
+    HEADER_VERSION_PLAIN, HeaderCompressed, HeaderPlain,
 };
-use super::GraphLinksFormat;
+use super::{GraphLinksFallbackDecodeTelemetry, GraphLinksFormat};
 use crate::common::operation_error::{OperationError, OperationResult};
-use crate::index::hnsw_index::graph_links::header::HeaderCompressedWithVectors;
 use crate::index::hnsw_index::HnswM;
+use crate::index::hnsw_index::graph_links::header::HeaderCompressedWithVectors;
+
+static LEGACY_PLAIN_BIG_ENDIAN_FALLBACK_LOADS: AtomicU64 = AtomicU64::new(0);
+static LEGACY_COMPRESSED_BIG_ENDIAN_FALLBACK_LOADS: AtomicU64 = AtomicU64::new(0);
+static LEGACY_COMPRESSED_WITH_VECTORS_BIG_ENDIAN_FALLBACK_LOADS: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn fallback_decode_telemetry() -> GraphLinksFallbackDecodeTelemetry {
+    GraphLinksFallbackDecodeTelemetry {
+        legacy_plain_big_endian_fallback_loads: LEGACY_PLAIN_BIG_ENDIAN_FALLBACK_LOADS
+            .load(Ordering::Relaxed),
+        legacy_compressed_big_endian_fallback_loads: LEGACY_COMPRESSED_BIG_ENDIAN_FALLBACK_LOADS
+            .load(Ordering::Relaxed),
+        legacy_compressed_with_vectors_big_endian_fallback_loads:
+            LEGACY_COMPRESSED_WITH_VECTORS_BIG_ENDIAN_FALLBACK_LOADS.load(Ordering::Relaxed),
+    }
+}
 
 /// An (almost) zero-copy, non-owning view into serialized graph links stored
 /// as a `&[u8]` slice.
@@ -136,7 +152,18 @@ impl GraphLinksView<'_> {
         for endian in endians_to_try {
             let header = decode_plain_header(header_bytes, endian)?;
             match Self::load_plain_with_endian(bytes, header, endian) {
-                Ok(view) => return Ok(view),
+                Ok(view) => {
+                    if matches!(endian, PlainEndian::Big) {
+                        let prev =
+                            LEGACY_PLAIN_BIG_ENDIAN_FALLBACK_LOADS.fetch_add(1, Ordering::Relaxed);
+                        if prev == 0 {
+                            log::warn!(
+                                "Loaded HNSW plain GraphLinks via legacy big-endian fallback decode; rewrite segment files to migrate to canonical format"
+                            );
+                        }
+                    }
+                    return Ok(view);
+                }
                 Err(err) => {
                     if first_error.is_none() {
                         first_error = Some(err);
@@ -204,7 +231,18 @@ impl GraphLinksView<'_> {
         let mut first_error = None;
         for endian in endians_to_try {
             match Self::load_compressed_with_endian(data, &header, *endian) {
-                Ok(view) => return Ok(view),
+                Ok(view) => {
+                    if matches!(endian, PlainEndian::Big) {
+                        let prev = LEGACY_COMPRESSED_BIG_ENDIAN_FALLBACK_LOADS
+                            .fetch_add(1, Ordering::Relaxed);
+                        if prev == 0 {
+                            log::warn!(
+                                "Loaded HNSW compressed GraphLinks via legacy big-endian fallback decode; rewrite segment files to migrate to canonical format"
+                            );
+                        }
+                    }
+                    return Ok(view);
+                }
                 Err(err) => {
                     if first_error.is_none() {
                         first_error = Some(err);
@@ -248,7 +286,18 @@ impl GraphLinksView<'_> {
                 link_vector_layout,
                 *endian,
             ) {
-                Ok(view) => return Ok(view),
+                Ok(view) => {
+                    if matches!(endian, PlainEndian::Big) {
+                        let prev = LEGACY_COMPRESSED_WITH_VECTORS_BIG_ENDIAN_FALLBACK_LOADS
+                            .fetch_add(1, Ordering::Relaxed);
+                        if prev == 0 {
+                            log::warn!(
+                                "Loaded HNSW compressed-with-vectors GraphLinks via legacy big-endian fallback decode; rewrite segment files to migrate to canonical format"
+                            );
+                        }
+                    }
+                    return Ok(view);
+                }
                 Err(err) => {
                     if first_error.is_none() {
                         first_error = Some(err);
@@ -495,10 +544,12 @@ impl GraphLinksView<'_> {
                 let mut base_vector: &[u8] = &[];
                 if level == 0 {
                     base_vector = &neighbors[pos..pos + base_vector_layout.size()];
-                    debug_assert!(base_vector
-                        .as_ptr()
-                        .addr()
-                        .is_multiple_of(base_vector_layout.align()));
+                    debug_assert!(
+                        base_vector
+                            .as_ptr()
+                            .addr()
+                            .is_multiple_of(base_vector_layout.align())
+                    );
                     pos += base_vector_layout.size();
                 }
 

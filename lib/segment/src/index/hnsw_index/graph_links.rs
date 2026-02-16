@@ -60,6 +60,37 @@ pub enum GraphLinksFormat {
     CompressedWithVectors,
 }
 
+/// Current persisted-format versions and legacy decode fallback counters for graph links.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GraphLinksCompatibilityTelemetry {
+    pub plain_version: u64,
+    pub compressed_version: u64,
+    pub compressed_legacy_version: u64,
+    pub compressed_with_vectors_version: u64,
+    pub compressed_with_vectors_legacy_version: u64,
+    pub fallback_decode: GraphLinksFallbackDecodeTelemetry,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GraphLinksFallbackDecodeTelemetry {
+    pub legacy_plain_big_endian_fallback_loads: u64,
+    pub legacy_compressed_big_endian_fallback_loads: u64,
+    pub legacy_compressed_with_vectors_big_endian_fallback_loads: u64,
+}
+
+pub fn graph_links_compatibility_telemetry() -> GraphLinksCompatibilityTelemetry {
+    let fallback = view::fallback_decode_telemetry();
+    GraphLinksCompatibilityTelemetry {
+        plain_version: header::HEADER_VERSION_PLAIN,
+        compressed_version: header::HEADER_VERSION_COMPRESSED,
+        compressed_legacy_version: header::HEADER_VERSION_COMPRESSED_LEGACY,
+        compressed_with_vectors_version: header::HEADER_VERSION_COMPRESSED_WITH_VECTORS,
+        compressed_with_vectors_legacy_version:
+            header::HEADER_VERSION_COMPRESSED_WITH_VECTORS_LEGACY,
+        fallback_decode: fallback,
+    }
+}
+
 /// Similar to [`GraphLinksFormat`], won't let you use `CompressedWithVectors`
 /// without providing the vectors.
 #[derive(Clone, Copy)]
@@ -567,12 +598,19 @@ mod tests {
         let path = Builder::new().prefix("graph_dir").tempdir().unwrap();
         let links_file = path.path().join("legacy_plain_be_links.bin");
         fs_err::write(&links_file, legacy_plain_big_endian_fixture()).unwrap();
+        let before = graph_links_compatibility_telemetry()
+            .fallback_decode
+            .legacy_plain_big_endian_fallback_loads;
 
         let links = GraphLinks::load_from_file(&links_file, true, GraphLinksFormat::Plain).unwrap();
 
         assert_eq!(links.format(), GraphLinksFormat::Plain);
         assert_eq!(links.links(0, 0).collect::<Vec<_>>(), vec![1]);
         assert_eq!(links.links(1, 0).collect::<Vec<_>>(), vec![0]);
+        let after = graph_links_compatibility_telemetry()
+            .fallback_decode
+            .legacy_plain_big_endian_fallback_loads;
+        assert!(after > before);
     }
 
     #[test]
@@ -580,6 +618,9 @@ mod tests {
         let path = Builder::new().prefix("graph_dir").tempdir().unwrap();
         let links_file = path.path().join("legacy_compressed_be_links.bin");
         fs_err::write(&links_file, legacy_compressed_big_endian_fixture()).unwrap();
+        let before = graph_links_compatibility_telemetry()
+            .fallback_decode
+            .legacy_compressed_big_endian_fallback_loads;
 
         let links =
             GraphLinks::load_from_file(&links_file, true, GraphLinksFormat::Compressed).unwrap();
@@ -587,6 +628,10 @@ mod tests {
         assert_eq!(links.format(), GraphLinksFormat::Compressed);
         assert_eq!(links.links(0, 0).collect::<Vec<_>>(), vec![1]);
         assert_eq!(links.links(1, 0).collect::<Vec<_>>(), vec![0]);
+        let after = graph_links_compatibility_telemetry()
+            .fallback_decode
+            .legacy_compressed_big_endian_fallback_loads;
+        assert!(after > before);
     }
 
     #[test]
@@ -602,6 +647,9 @@ mod tests {
             legacy_compressed_with_vectors_big_endian_fixture(links.clone(), &vectors),
         )
         .unwrap();
+        let before = graph_links_compatibility_telemetry()
+            .fallback_decode
+            .legacy_compressed_with_vectors_big_endian_fallback_loads;
 
         let loaded =
             GraphLinks::load_from_file(&links_file, true, GraphLinksFormat::CompressedWithVectors)
@@ -609,6 +657,10 @@ mod tests {
 
         assert_eq!(loaded.format(), GraphLinksFormat::CompressedWithVectors);
         check_links(links, &loaded, &Some(vectors));
+        let after = graph_links_compatibility_telemetry()
+            .fallback_decode
+            .legacy_compressed_with_vectors_big_endian_fallback_loads;
+        assert!(after > before);
     }
 
     #[test]
@@ -628,9 +680,10 @@ mod tests {
         let err = GraphLinks::load_from_file(&links_file, true, GraphLinksFormat::Plain)
             .err()
             .expect("invalid plain layout must fail");
-        assert!(err
-            .to_string()
-            .contains("Invalid plain GraphLinks level/point counts"));
+        assert!(
+            err.to_string()
+                .contains("Invalid plain GraphLinks level/point counts")
+        );
     }
 
     #[test]
@@ -656,9 +709,10 @@ mod tests {
         let err = GraphLinks::load_from_file(&links_file, true, GraphLinksFormat::Compressed)
             .err()
             .expect("invalid compressed layout must fail");
-        assert!(err
-            .to_string()
-            .contains("Invalid compressed GraphLinks level/point counts"));
+        assert!(
+            err.to_string()
+                .contains("Invalid compressed GraphLinks level/point counts")
+        );
     }
 
     fn legacy_plain_big_endian_fixture() -> Vec<u8> {

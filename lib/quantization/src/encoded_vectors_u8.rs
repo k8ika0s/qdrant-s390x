@@ -24,6 +24,10 @@ const ADDITIONAL_CONSTANT_SIZE: usize = std::mem::size_of::<f32>();
 // v2+: per-vector constant persisted in canonical little-endian.
 const METADATA_FORMAT_VERSION: u32 = 2;
 
+pub const fn metadata_format_version() -> u32 {
+    METADATA_FORMAT_VERSION
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum VectorOffsetEncoding {
     LegacyNative,
