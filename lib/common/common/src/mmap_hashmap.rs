@@ -127,6 +127,10 @@ struct HeaderDisk {
     buckets_count: u64,
 }
 
+// The mmap_hashmap file format depends on a stable header layout.
+const _: [u8; 24] = [0; size_of::<HeaderDisk>()];
+const _: [u8; 8] = [0; align_of::<HeaderDisk>()];
+
 #[derive(Copy, Clone, Debug)]
 struct Header {
     key_type: [u8; 8],
@@ -810,6 +814,49 @@ mod tests {
     use rand::SeedableRng as _;
 
     use super::*;
+
+    #[test]
+    fn test_values_are_persisted_as_canonical_little_endian_bytes() {
+        let tmpdir = tempfile::Builder::new().tempdir().unwrap();
+        let path = tmpdir.path().join("map");
+
+        let key = 42i64;
+        let value = 0x01020304u32;
+
+        let mut map: HashMap<i64, BTreeSet<u32>> = Default::default();
+        map.insert(key, [value].into_iter().collect());
+
+        MmapHashMap::<i64, u32>::create(
+            &path,
+            map.iter().map(|(k, v)| (k, v.iter().copied())),
+        )
+        .unwrap();
+
+        let mmap = MmapHashMap::<i64, u32>::open(&path, false).unwrap();
+        let hash = mmap.phf.get(&key).unwrap() as usize;
+        let entry = mmap.get_entry(hash).unwrap();
+
+        // i64 keys are persisted as canonical LE bytes.
+        assert_eq!(entry.get(..8).unwrap(), key.to_le_bytes().as_ref());
+
+        // ValuesLen is persisted as u32 LE bytes, followed by canonical LE values.
+        let key_size_with_padding =
+            key.write_bytes().next_multiple_of(MmapHashMap::<i64, u32>::VALUE_SIZE);
+        let values_len_off = key_size_with_padding;
+        let values_len: u32 = u32::from_le_bytes(
+            entry[values_len_off..values_len_off + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(values_len, 1);
+
+        let values_off =
+            key_size_with_padding + MmapHashMap::<i64, u32>::values_len_size_with_padding();
+        assert_eq!(
+            entry.get(values_off..values_off + 4).unwrap(),
+            value.to_le_bytes().as_ref(),
+        );
+    }
 
     #[test]
     fn test_mmap_hash() {
