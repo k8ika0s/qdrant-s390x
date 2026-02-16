@@ -525,11 +525,10 @@ impl InvertedIndex for MmapInvertedIndex {
 
         self.storage
             .vocab
-            .get(token)
+            .get_stored(token)
             .ok()
             .flatten()
-            .and_then(<[TokenId]>::first)
-            .copied()
+            .and_then(|v| v.as_stored().first().copied())
             .map(TokenId::from_le)
     }
 }

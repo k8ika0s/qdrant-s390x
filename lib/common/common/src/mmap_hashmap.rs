@@ -378,17 +378,29 @@ impl<K: Key + ?Sized, V: Sized + PersistLe + FromBytes + Immutable + IntoBytes +
         KeysIter { map: self, idx: 0 }
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&K, &[V])> + '_ {
+    fn iter_raw(&self) -> impl Iterator<Item = (&K, &[V])> + '_ {
         EntriesIter { map: self, idx: 0 }
     }
 
+    #[cfg_attr(
+        target_endian = "big",
+        deprecated(
+            note = "Values are persisted in canonical little-endian. \
+On big-endian hosts this returns raw stored bytes reinterpreted as native values. \
+Use iter_stored()/get_stored() + StoredValues::iter_native() instead."
+        )
+    )]
+    pub fn iter(&self) -> impl Iterator<Item = (&K, &[V])> + '_ {
+        self.iter_raw()
+    }
+
     pub fn iter_stored(&self) -> impl Iterator<Item = (&K, StoredValues<'_, V>)> + '_ {
-        self.iter()
+        self.iter_raw()
             .map(|(k, v)| (k, StoredValues { stored: v }))
     }
 
     /// Get the values associated with the `key`.
-    pub fn get(&self, key: &K) -> io::Result<Option<&[V]>> {
+    fn get_raw(&self, key: &K) -> io::Result<Option<&[V]>> {
         let Some(hash) = self.phf.get(key) else {
             return Ok(None);
         };
@@ -402,8 +414,20 @@ impl<K: Key + ?Sized, V: Sized + PersistLe + FromBytes + Immutable + IntoBytes +
         Ok(Some(Self::get_values_from_entry(entry, key)?))
     }
 
+    #[cfg_attr(
+        target_endian = "big",
+        deprecated(
+            note = "Values are persisted in canonical little-endian. \
+On big-endian hosts this returns raw stored bytes reinterpreted as native values. \
+Use get_stored() + StoredValues::iter_native() instead."
+        )
+    )]
+    pub fn get(&self, key: &K) -> io::Result<Option<&[V]>> {
+        self.get_raw(key)
+    }
+
     pub fn get_stored(&self, key: &K) -> io::Result<Option<StoredValues<'_, V>>> {
-        Ok(self.get(key)?.map(|v| StoredValues { stored: v }))
+        Ok(self.get_raw(key)?.map(|v| StoredValues { stored: v }))
     }
 
     fn get_values_from_entry<'a>(entry: &'a [u8], key: &K) -> io::Result<&'a [V]> {
@@ -813,7 +837,7 @@ mod tests {
         // Non-existing keys should return None
         for _ in 0..1000 {
             let key = repeat_until(|| generator(&mut rng), |key| !map.contains_key(key));
-            assert!(mmap.get(as_ref(&key)).unwrap().is_none());
+            assert!(mmap.get_stored(as_ref(&key)).unwrap().is_none());
         }
 
         // check keys iterator
@@ -824,10 +848,8 @@ mod tests {
         assert_eq!(mmap.keys_count(), map.len());
         assert_eq!(mmap.keys().count(), map.len());
 
-        for (k, v) in mmap.iter() {
-            let v = StoredValues { stored: v }
-                .iter_native()
-                .collect::<BTreeSet<_>>();
+        for (k, v) in mmap.iter_stored() {
+            let v = v.iter_native().collect::<BTreeSet<_>>();
             assert_eq!(map.get(&from_ref(k)).unwrap(), &v);
         }
 
@@ -870,18 +892,16 @@ mod tests {
         for (k, v) in map {
             let expected = v.into_iter().collect::<Vec<_>>();
             assert_eq!(
-                mmap.get(&k)
+                mmap.get_stored(&k)
                     .unwrap()
                     .unwrap()
-                    .iter()
-                    .copied()
-                    .map(u64::from_le)
+                    .iter_native()
                     .collect::<Vec<_>>(),
                 expected
             );
         }
 
-        assert!(mmap.get(&100).unwrap().is_none())
+        assert!(mmap.get_stored(&100).unwrap().is_none())
     }
 
     #[test]
@@ -910,16 +930,47 @@ mod tests {
         for (k, v) in map {
             let expected = v.into_iter().collect::<Vec<_>>();
             assert_eq!(
-                mmap.get(&k)
+                mmap.get_stored(&k)
                     .unwrap()
                     .unwrap()
-                    .iter()
-                    .copied()
-                    .map(u32::from_le)
+                    .iter_native()
                     .collect::<Vec<_>>(),
                 expected
             );
         }
-        assert!(mmap.get(&100).unwrap().is_none())
+        assert!(mmap.get_stored(&100).unwrap().is_none())
+    }
+
+    #[test]
+    #[cfg(target_endian = "big")]
+    fn test_get_raw_returns_raw_stored_values_on_be() {
+        let tmpdir = tempfile::Builder::new().tempdir().unwrap();
+
+        let key = 42i64;
+        let value = 1u32;
+
+        let mut map: HashMap<i64, BTreeSet<u32>> = Default::default();
+        map.insert(key, [value].into_iter().collect());
+
+        MmapHashMap::<i64, u32>::create(
+            &tmpdir.path().join("map"),
+            map.iter().map(|(k, v)| (k, v.iter().copied())),
+        )
+        .unwrap();
+        let mmap = MmapHashMap::<i64, u32>::open(&tmpdir.path().join("map"), true).unwrap();
+
+        // `get_raw` returns stored LE bytes reinterpreted as native. On BE, that means values are
+        // byte-swapped relative to the original.
+        let raw = mmap.get_raw(&key).unwrap().unwrap()[0];
+        assert_eq!(raw, value.swap_bytes());
+
+        // The public, endian-safe API should always yield native values.
+        let decoded = mmap
+            .get_stored(&key)
+            .unwrap()
+            .unwrap()
+            .iter_native()
+            .collect::<Vec<_>>();
+        assert_eq!(decoded, vec![value]);
     }
 }
