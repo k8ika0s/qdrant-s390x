@@ -58,3 +58,7 @@ harness = false
 [[bench]]
 name = "p_square"
 harness = false
+
+[[bench]]
+name = "persistence_smoke"
+harness = false

@@ -390,6 +390,21 @@ fn hit_id_u64(hit: &serde_json::Value) -> Option<u64> {
     id.get("num").and_then(|n| n.as_u64())
 }
 
+fn binary_quant_fixture_vector(id: u64) -> Vec<f32> {
+    // One-bit binary quantization only keeps sign information. To keep rankings
+    // deterministic, encode each point id as a unique sign pattern.
+    let bits = id.saturating_sub(1);
+    (0..8)
+        .map(|bit| {
+            if ((bits >> bit) & 1) == 1 {
+                0.9
+            } else {
+                -0.9
+            }
+        })
+        .collect()
+}
+
 fn http_delete_collection_if_exists(
     client: &Client,
     base_url: &str,
@@ -641,10 +656,9 @@ fn http_upsert_binary_quant_points(
     // Keep this deterministic (no rng) so fixtures are reproducible.
     let points: Vec<_> = (1..=8)
         .map(|id| {
-            let x = id as f32 / 10.0;
             json!({
                 "id": id,
-                "vector": [x, 0.2, 0.3, 0.4, x, 0.2, 0.3, 0.4],
+                "vector": binary_quant_fixture_vector(id),
                 "payload": { "id": id }
             })
         })
@@ -681,7 +695,14 @@ fn http_search_binary_quant_and_assert(
     log_path: &Path,
 ) {
     let body = json!({
-        "vector": [0.2, 0.1, 0.9, 0.7, 0.2, 0.1, 0.9, 0.7],
+        "vector": binary_quant_fixture_vector(8),
+        "params": {
+            "quantization": {
+                "ignore": false,
+                "rescore": true,
+                "oversampling": 4.0
+            }
+        },
         "limit": 3
     });
 
