@@ -21,12 +21,37 @@ use crate::{
     VectorParameters,
 };
 
-const METADATA_FORMAT_VERSION: u32 = 1;
+// v1 and earlier: encoded words persisted in native-endian (non-portable on BE).
+// v2+: encoded words persisted in canonical little-endian bytes.
+const METADATA_FORMAT_VERSION: u32 = 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StorageWordOrder {
+    LegacyNative,
+    CanonicalLe,
+}
+
+impl StorageWordOrder {
+    #[inline]
+    fn from_metadata_format_version(version: u32) -> Self {
+        if version >= 2 {
+            Self::CanonicalLe
+        } else {
+            Self::LegacyNative
+        }
+    }
+
+    #[inline]
+    fn is_canonical_le(self) -> bool {
+        matches!(self, Self::CanonicalLe)
+    }
+}
 
 pub struct EncodedVectorsBin<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage> {
     encoded_vectors: TStorage,
     metadata: Metadata,
     metadata_path: Option<PathBuf>,
+    storage_word_order: StorageWordOrder,
     bits_store_type: PhantomData<TBitsStoreType>,
 }
 
@@ -428,10 +453,13 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
     }
 
     #[inline]
-    fn canonicalize_words_in_place(words: &mut [TBitsStoreType]) {
-        // Persist words in canonical little-endian. On big-endian we also swap query words so that
+    fn canonicalize_words_in_place(
+        words: &mut [TBitsStoreType],
+        storage_word_order: StorageWordOrder,
+    ) {
+        // Persist words in canonical little-endian (v2+). On big-endian we also swap query words so that
         // scoring stays consistent with the on-disk representation (and remains zero-copy).
-        if cfg!(target_endian = "big") {
+        if storage_word_order.is_canonical_le() && cfg!(target_endian = "big") {
             for word in words {
                 // Swap bytes in-place (e.g. u128) so the on-disk representation is canonical LE.
                 // For u8 this is a no-op.
@@ -474,7 +502,10 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
             }
 
             let mut encoded_vector = Self::encode_vector(vector.as_ref(), &vector_stats, encoding);
-            Self::canonicalize_words_in_place(&mut encoded_vector.encoded_vector);
+            Self::canonicalize_words_in_place(
+                &mut encoded_vector.encoded_vector,
+                StorageWordOrder::CanonicalLe,
+            );
             let encoded_vector_slice = encoded_vector.encoded_vector.as_slice();
             // TODO Safety: bytemuck::Pod type, but is it enough for slice?
             #[expect(deprecated, reason = "legacy code")]
@@ -519,6 +550,7 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
             encoded_vectors,
             metadata,
             metadata_path: meta_path.map(PathBuf::from),
+            storage_word_order: StorageWordOrder::CanonicalLe,
             bits_store_type: PhantomData,
         })
     }
@@ -535,10 +567,13 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
                 ),
             ));
         }
+        let storage_word_order =
+            StorageWordOrder::from_metadata_format_version(metadata.format_version);
         let result = Self {
             metadata,
             metadata_path: Some(meta_path.to_path_buf()),
             encoded_vectors,
+            storage_word_order,
             bits_store_type: PhantomData,
         };
         Ok(result)
@@ -687,6 +722,7 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
         vector_stats: &Option<VectorStats>,
         encoding: Encoding,
         query_encoding: QueryEncoding,
+        storage_word_order: StorageWordOrder,
     ) -> EncodedQueryBQ<TBitsStoreType> {
         let mut encoded = match query_encoding {
             QueryEncoding::SameAsStorage => {
@@ -701,9 +737,11 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
         };
 
         match &mut encoded {
-            EncodedQueryBQ::Binary(v) => Self::canonicalize_words_in_place(&mut v.encoded_vector),
+            EncodedQueryBQ::Binary(v) => {
+                Self::canonicalize_words_in_place(&mut v.encoded_vector, storage_word_order)
+            }
             EncodedQueryBQ::Scalar4bits(v) | EncodedQueryBQ::Scalar8bits(v) => {
-                Self::canonicalize_words_in_place(&mut v.encoded_vector)
+                Self::canonicalize_words_in_place(&mut v.encoded_vector, storage_word_order)
             }
         }
 
@@ -883,6 +921,7 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage> EncodedVectors
             &self.metadata.vector_stats,
             self.metadata.encoding,
             self.metadata.query_encoding,
+            self.storage_word_order,
         )
     }
 
@@ -949,7 +988,10 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage> EncodedVectors
     ) -> std::io::Result<()> {
         let mut encoded_vector =
             Self::encode_vector(vector, &self.metadata.vector_stats, self.metadata.encoding);
-        Self::canonicalize_words_in_place(&mut encoded_vector.encoded_vector);
+        Self::canonicalize_words_in_place(
+            &mut encoded_vector.encoded_vector,
+            self.storage_word_order,
+        );
         self.encoded_vectors.upsert_vector(
             id,
             bytemuck::cast_slice(encoded_vector.encoded_vector.as_slice()),

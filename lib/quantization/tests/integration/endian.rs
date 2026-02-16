@@ -50,6 +50,53 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_endian = "big")]
+    fn test_binary_v1_legacy_native_words_load_and_score_on_be() {
+        use std::fs;
+
+        use tempfile::Builder;
+
+        let vector_dim = 1usize;
+
+        let quantized_vector_size =
+            EncodedVectorsBin::<u128, TestEncodedStorage>::get_quantized_vector_size_from_params(
+                vector_dim,
+                Encoding::OneBit,
+            );
+
+        let dir = Builder::new().prefix("bq_v1_legacy").tempdir().unwrap();
+        let data_path = dir.path().join("data.bin");
+        let meta_path = dir.path().join("meta.json");
+
+        // v1 legacy on BE stored words in native endian; for u128=1 this is `to_be_bytes()`.
+        fs::write(&data_path, 1u128.to_be_bytes()).unwrap();
+
+        let meta = serde_json::json!({
+            "format_version": 1,
+            "vector_parameters": {
+                "dim": vector_dim,
+                "distance_type": "Dot",
+                "invert": false
+            },
+            "encoding": "OneBit",
+            "query_encoding": "SameAsStorage"
+        });
+        fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+
+        let storage = TestEncodedStorage::from_file(&data_path, quantized_vector_size).unwrap();
+        let encoded = EncodedVectorsBin::<u128, _>::load(storage, &meta_path).unwrap();
+
+        let stored = encoded.storage().get_vector_data(0);
+        assert_eq!(stored, 1u128.to_be_bytes().as_slice());
+
+        let query = vec![1.0f32];
+        let query_encoded = encoded.encode_query(&query);
+        let counter = HardwareCounterCell::new();
+        let score = encoded.score_point(&query_encoded, 0, &counter);
+        assert!((score - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
     fn test_binary_xor_popcnt_invariant_under_byte_swaps() {
         fn xor_popcnt_u128(v1: &[u128], v2: &[u128]) -> usize {
             v1.iter()

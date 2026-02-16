@@ -20,7 +20,26 @@ use crate::quantile::{find_min_max_from_iter, find_quantile_interval};
 pub const ALIGNMENT: usize = 16;
 // Each encoded vector stores an additional f32 at the beginning. Define it's size here.
 const ADDITIONAL_CONSTANT_SIZE: usize = std::mem::size_of::<f32>();
-const METADATA_FORMAT_VERSION: u32 = 1;
+// v1 and earlier: per-vector constant persisted in native-endian (non-portable on BE).
+// v2+: per-vector constant persisted in canonical little-endian.
+const METADATA_FORMAT_VERSION: u32 = 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VectorOffsetEncoding {
+    LegacyNative,
+    CanonicalLe,
+}
+
+impl VectorOffsetEncoding {
+    #[inline]
+    fn from_metadata_format_version(version: u32) -> Self {
+        if version >= 2 {
+            Self::CanonicalLe
+        } else {
+            Self::LegacyNative
+        }
+    }
+}
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum ScalarQuantizationMethod {
@@ -32,6 +51,7 @@ pub struct EncodedVectorsU8<TStorage: EncodedStorage> {
     encoded_vectors: TStorage,
     metadata: Metadata,
     metadata_path: Option<PathBuf>,
+    offset_encoding: VectorOffsetEncoding,
 }
 
 pub struct EncodedQueryU8 {
@@ -186,6 +206,7 @@ impl<TStorage: EncodedStorage> EncodedVectorsU8<TStorage> {
                 })?,
                 metadata,
                 metadata_path: meta_path.map(PathBuf::from),
+                offset_encoding: VectorOffsetEncoding::CanonicalLe,
             });
         }
 
@@ -315,6 +336,7 @@ impl<TStorage: EncodedStorage> EncodedVectorsU8<TStorage> {
             encoded_vectors,
             metadata,
             metadata_path: meta_path.map(PathBuf::from),
+            offset_encoding: VectorOffsetEncoding::CanonicalLe,
         })
     }
 
@@ -334,10 +356,17 @@ impl<TStorage: EncodedStorage> EncodedVectorsU8<TStorage> {
                 }
             }
         }
+        // Determine on-disk encoding rules from metadata (post validation).
+        let offset_encoding = match &metadata {
+            Metadata::Int8(meta) => {
+                VectorOffsetEncoding::from_metadata_format_version(meta.format_version)
+            }
+        };
         let result = Self {
             encoded_vectors,
             metadata,
             metadata_path: Some(meta_path.to_path_buf()),
+            offset_encoding,
         };
         Ok(result)
     }
@@ -345,7 +374,7 @@ impl<TStorage: EncodedStorage> EncodedVectorsU8<TStorage> {
     pub fn score_point_simple(&self, query: &EncodedQueryU8, bytes: &[u8]) -> f32 {
         match &self.metadata {
             Metadata::Int8(metadata) => {
-                let (vector_offset, v_ptr) = Self::parse_vec_data(bytes);
+                let (vector_offset, v_ptr) = self.parse_vec_data(bytes);
                 let q_ptr = query.encoded_query.as_ptr();
 
                 let score = match metadata.vector_parameters.distance_type {
@@ -382,7 +411,7 @@ impl<TStorage: EncodedStorage> EncodedVectorsU8<TStorage> {
     pub fn score_point_neon(&self, query: &EncodedQueryU8, bytes: &[u8]) -> f32 {
         match &self.metadata {
             Metadata::Int8(metadata) => {
-                let (vector_offset, v_ptr) = Self::parse_vec_data(bytes);
+                let (vector_offset, v_ptr) = self.parse_vec_data(bytes);
                 let q_ptr = query.encoded_query.as_ptr();
 
                 let score = match metadata.vector_parameters.distance_type {
@@ -424,7 +453,7 @@ impl<TStorage: EncodedStorage> EncodedVectorsU8<TStorage> {
     pub fn score_point_sse(&self, query: &EncodedQueryU8, bytes: &[u8]) -> f32 {
         match &self.metadata {
             Metadata::Int8(metadata) => {
-                let (vector_offset, v_ptr) = Self::parse_vec_data(bytes);
+                let (vector_offset, v_ptr) = self.parse_vec_data(bytes);
                 let q_ptr = query.encoded_query.as_ptr();
 
                 let score = match metadata.vector_parameters.distance_type {
@@ -466,7 +495,7 @@ impl<TStorage: EncodedStorage> EncodedVectorsU8<TStorage> {
     pub fn score_point_avx(&self, query: &EncodedQueryU8, bytes: &[u8]) -> f32 {
         match &self.metadata {
             Metadata::Int8(metadata) => {
-                let (vector_offset, v_ptr) = Self::parse_vec_data(bytes);
+                let (vector_offset, v_ptr) = self.parse_vec_data(bytes);
                 let q_ptr = query.encoded_query.as_ptr();
 
                 let score = match metadata.vector_parameters.distance_type {
@@ -517,22 +546,50 @@ impl<TStorage: EncodedStorage> EncodedVectorsU8<TStorage> {
         (alpha, offset)
     }
 
+    #[cfg(test)]
     #[inline]
-    fn parse_vec_data(data: &[u8]) -> (f32, *const u8) {
+    fn parse_vec_data_with_format_version(data: &[u8], format_version: u32) -> (f32, *const u8) {
+        let offset_encoding = VectorOffsetEncoding::from_metadata_format_version(format_version);
+        Self::parse_vec_data_with_encoding(data, offset_encoding)
+    }
+
+    #[inline]
+    fn parse_vec_data_with_encoding(
+        data: &[u8],
+        offset_encoding: VectorOffsetEncoding,
+    ) -> (f32, *const u8) {
         debug_assert!(data.len() >= ADDITIONAL_CONSTANT_SIZE);
         unsafe {
-            // Offsets are persisted in canonical little-endian.
             let bits = data.as_ptr().cast::<u32>().read_unaligned();
-            let offset = f32::from_bits(u32::from_le(bits));
+            let bits = match offset_encoding {
+                VectorOffsetEncoding::LegacyNative => bits,
+                VectorOffsetEncoding::CanonicalLe => u32::from_le(bits),
+            };
+            let offset = f32::from_bits(bits);
             let v_ptr = data.as_ptr().add(ADDITIONAL_CONSTANT_SIZE);
             (offset, v_ptr)
         }
     }
 
     #[inline]
+    fn parse_vec_data(&self, data: &[u8]) -> (f32, *const u8) {
+        match &self.metadata {
+            Metadata::Int8(meta) => {
+                // `offset_encoding` is derived from `meta.format_version`; keep this `debug_assert`
+                // to catch accidental divergence if one is updated without the other.
+                debug_assert_eq!(
+                    self.offset_encoding,
+                    VectorOffsetEncoding::from_metadata_format_version(meta.format_version)
+                );
+            }
+        }
+        Self::parse_vec_data_with_encoding(data, self.offset_encoding)
+    }
+
+    #[inline]
     fn get_vec_ptr(&self, i: PointOffsetType) -> (f32, *const u8) {
         let data = self.encoded_vectors.get_vector_data(i);
-        Self::parse_vec_data(data)
+        self.parse_vec_data(data)
     }
 
     pub fn get_quantized_vector(&self, i: PointOffsetType) -> &[u8] {
@@ -842,12 +899,29 @@ mod endian_tests {
     }
 
     #[test]
-    fn parse_vec_data_reads_offset_as_le() {
+    fn parse_vec_data_v2_reads_offset_as_le() {
         let mut data = Vec::new();
         data.extend_from_slice(&1.0f32.to_le_bytes());
         data.extend_from_slice(&[1u8, 2u8, 3u8]);
 
-        let (offset, v_ptr) = EncodedVectorsU8::<DummyStorage>::parse_vec_data(&data);
+        let (offset, v_ptr) =
+            EncodedVectorsU8::<DummyStorage>::parse_vec_data_with_format_version(&data, 2);
+        assert!((offset - 1.0).abs() < f32::EPSILON);
+
+        let code = unsafe { std::slice::from_raw_parts(v_ptr, 3) };
+        assert_eq!(code, &[1u8, 2u8, 3u8]);
+    }
+
+    #[test]
+    #[cfg(target_endian = "big")]
+    fn parse_vec_data_v1_reads_offset_as_native_endian() {
+        let mut data = Vec::new();
+        // Legacy v1 stored offsets in native-endian; on BE this matches big-endian.
+        data.extend_from_slice(&1.0f32.to_be_bytes());
+        data.extend_from_slice(&[1u8, 2u8, 3u8]);
+
+        let (offset, v_ptr) =
+            EncodedVectorsU8::<DummyStorage>::parse_vec_data_with_format_version(&data, 1);
         assert!((offset - 1.0).abs() < f32::EPSILON);
 
         let code = unsafe { std::slice::from_raw_parts(v_ptr, 3) };
@@ -862,7 +936,8 @@ mod endian_tests {
             let mut data = vec![0u8; ADDITIONAL_CONSTANT_SIZE + code_len];
             rng.fill(&mut data[..]);
 
-            let (_offset, v_ptr) = EncodedVectorsU8::<DummyStorage>::parse_vec_data(&data);
+            let (_offset, v_ptr) =
+                EncodedVectorsU8::<DummyStorage>::parse_vec_data_with_format_version(&data, 2);
             assert_eq!(v_ptr, unsafe {
                 data.as_ptr().add(ADDITIONAL_CONSTANT_SIZE)
             });
