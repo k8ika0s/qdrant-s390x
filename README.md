@@ -19,6 +19,89 @@
     <a href="https://cloud.qdrant.io/"><img src="https://img.shields.io/badge/Qdrant-Cloud-24386C.svg?logo=cloud&style=flat-square" alt="Qdrant Cloud"></a>
 </p>
 
+## s390x Compatibility Notes
+
+This fork includes active compatibility work for native `s390x` (IBM Z / zLinux, big-endian) builds
+and regression coverage for endian-sensitive persistence paths.
+
+For full details, see:
+- [docs/S390X.md](docs/S390X.md)
+- [docs/PERSISTENCE_ENDIANNESS.md](docs/PERSISTENCE_ENDIANNESS.md)
+
+### Prerequisites (native s390x host)
+
+- Linux `s390x` host (native validation recommended over emulation for final sign-off)
+- Rust stable toolchain (`cargo`, `rustc`)
+- `protoc` (required by Qdrant API build steps)
+- Build toolchain for native deps: `clang`, `cmake`, `pkg-config`, C/C++ compiler toolchain
+- `python3` and `curl` (required by smoke tooling)
+- Optional: `podman` or `docker` (for container smoke)
+
+### Build
+
+```bash
+cargo check -p qdrant --features rocksdb --locked
+cargo build -p qdrant --features rocksdb --locked
+```
+
+### Validate (recommended)
+
+Run the native gate sweep:
+
+```bash
+tools/run-s390x-gates.sh
+```
+
+Key targeted checks used in this repo:
+
+```bash
+cargo test -p common stable_hash --locked
+cargo test -p collection --locked test_routing_is_stable_across_architectures
+cargo test -p segment --locked endian
+cargo test -p quantization --locked endian
+cargo test -p qdrant --locked --test s390x_http_smoke --no-run
+cargo test -p qdrant --locked --test s390x_snapshot_smoke --no-run
+cargo test -p qdrant --locked --test s390x_snapshot_fixture_matrix --no-run
+bash -n tools/s390x-perf-smoke.sh
+bash -n tools/s390x-container-smoke.sh
+```
+
+### Optional Smokes
+
+```bash
+tools/s390x-perf-smoke.sh
+tools/s390x-container-smoke.sh
+```
+
+### Initial s390x Performance Snapshot
+
+These are initial native `s390x` reference numbers from early validation runs (2026-02-16) and are
+**subject to further tuning and remediation**.
+
+- Startup/runtime smoke (`tools/s390x-perf-smoke.sh`, native s390x):
+  - `boot1 ready_ms=719`, `boot2 ready_ms=668`
+  - `boot1 rss_after_workload_kb=128208`, `boot2 rss_after_workload_kb=123876`
+- Quantization persistence smoke (`cargo bench -p quantization --bench persistence_smoke`):
+  - `scalar_u8/encode`: `~4.639 ms`
+  - `scalar_u8/score_scan`: `~169.95 us`
+  - `binary_u8/encode`: `~1.494 ms`
+  - `binary_u8/score_scan`: `~94.21 us`
+- HNSW persistence smoke (`cargo bench -p segment --features rocksdb --bench hnsw_persistence_smoke`):
+  - `plain-build`: `~3.62 s`
+  - `plain-search`: `~139.54 us`
+  - `compressed-search`: `~145.21 us`
+- Sparse index build smoke (`cargo bench -p segment --features rocksdb --bench sparse_index_build`):
+  - `build-ram-index`: `~7.42 ms`
+  - `convert-mmap-index`: `~8.63 ms` (observed with wider run-to-run spread)
+
+Full reports and raw logs live under `dev-docs/s390x-validation/`.
+
+If host resources are limited, set:
+
+```bash
+CARGO_BUILD_JOBS=2
+```
+
 **Qdrant** (read: _quadrant_) is a vector similarity search engine and vector database.
 It provides a production-ready service with a convenient API to store, search, and manage points—vectors with an additional payload
 Qdrant is tailored to extended filtering support. It makes it useful for all sorts of neural-network or semantic-based matching, faceted search, and other applications.
