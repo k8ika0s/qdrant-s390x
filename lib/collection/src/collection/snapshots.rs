@@ -1,11 +1,11 @@
 use std::collections::HashSet;
 use std::path::Path;
 
+use common::fs::read_json;
+use common::storage_version::StorageVersion as _;
 use common::tar_ext::BuilderExt;
 use common::tar_unpack::tar_unpack_file;
 use fs_err::File;
-use io::file_operations::read_json;
-use io::storage_version::StorageVersion as _;
 use segment::types::SnapshotFormat;
 use segment::utils::fs::move_all;
 use shard::snapshots::snapshot_data::SnapshotData;
@@ -93,32 +93,41 @@ impl Collection {
                         global_temp_dir.display(),
                     ))
                 })?;
-            let shards_holder = self.shards_holder.read().await;
-            // Create snapshot of each shard
-            for (shard_id, replica_set) in shards_holder.get_shards() {
-                let shard_snapshot_path = shard_path(Path::new(""), shard_id);
 
-                // If node is listener, we can save whatever currently is in the storage
-                let save_wal = self.shared_storage_config.node_type != NodeType::Listener;
-                replica_set
-                    .create_snapshot(
-                        snapshot_temp_temp_dir.path(),
-                        &tar.descend(&shard_snapshot_path)?,
-                        SnapshotFormat::Regular,
-                        None,
-                        save_wal,
-                    )
-                    .await
-                    .map_err(|err| {
-                        CollectionError::service_error(format!("failed to create snapshot: {err}"))
-                    })?;
+            let mut futures = Vec::new();
+            {
+                let shards_holder = self.shards_holder.read().await;
+
+                // Create snapshot of each shard
+                for (shard_id, replica_set) in shards_holder.get_shards() {
+                    let shard_snapshot_path = shard_path(Path::new(""), shard_id);
+
+                    // If node is listener, we can save whatever currently is in the storage
+                    let save_wal = self.shared_storage_config.node_type != NodeType::Listener;
+                    let future = replica_set
+                        .create_snapshot(
+                            snapshot_temp_temp_dir.path(),
+                            tar.descend(&shard_snapshot_path)?,
+                            SnapshotFormat::Regular,
+                            None,
+                            save_wal,
+                        )
+                        .await?;
+                    futures.push(future);
+                }
+            }
+
+            for future in futures {
+                future.await.map_err(|err| {
+                    CollectionError::service_error(format!("failed to create snapshot: {err}"))
+                })?;
             }
         }
 
         // Save collection config and version
         tar.append_data(
             CollectionVersion::current_raw().as_bytes().to_vec(),
-            Path::new(io::storage_version::VERSION_FILE),
+            Path::new(common::storage_version::VERSION_FILE),
         )
         .await?;
 
@@ -279,11 +288,16 @@ impl Collection {
         shard_id: ShardId,
         temp_dir: &Path,
     ) -> CollectionResult<SnapshotDescription> {
-        self.shards_holder
+        let snapshot_creator = self
+            .shards_holder
             .read()
             .await
             .create_shard_snapshot(&self.snapshots_path, self.name(), shard_id, temp_dir)
-            .await
+            .await?;
+        // We don't hold shards_holder lock here on purpose,
+        // because snapshot creation may take a long time,
+        // and we don't want to block other operations on the collection.
+        snapshot_creator.await
     }
 
     pub async fn stream_shard_snapshot(

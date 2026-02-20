@@ -6,8 +6,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use common::counter::hardware_counter::HardwareCounterCell;
+use common::mmap::AdviceSetting;
 use criterion::{Criterion, criterion_group, criterion_main};
-use memory::madvise::AdviceSetting;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use segment::data_types::vectors::VectorElementType;

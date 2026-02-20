@@ -1,15 +1,12 @@
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
-use common::tar_ext;
 use segment::data_types::facets::{FacetParams, FacetResponse};
 use segment::index::field_index::CardinalityEstimation;
 use segment::types::{
-    ExtendedPointId, Filter, ScoredPoint, SizeStats, SnapshotFormat, WithPayload,
-    WithPayloadInterface, WithVector,
+    ExtendedPointId, Filter, ScoredPoint, SizeStats, WithPayload, WithPayloadInterface, WithVector,
 };
 use shard::count::CountRequestInternal;
 use shard::operations::CollectionUpdateOperations;
@@ -40,26 +37,15 @@ impl DummyShard {
         }
     }
 
-    pub async fn create_snapshot(
-        &self,
-        _temp_path: &Path,
-        _tar: &tar_ext::BuilderExt,
-        _format: SnapshotFormat,
-        _manifest: Option<SnapshotManifest>,
-        _save_wal: bool,
-    ) -> CollectionResult<()> {
-        self.dummy()
-    }
-
     pub fn snapshot_manifest(&self) -> CollectionResult<SnapshotManifest> {
         Ok(SnapshotManifest::default())
     }
 
-    pub async fn on_optimizer_config_update(&self) -> CollectionResult<()> {
+    pub fn on_optimizer_config_update(&self) -> CollectionResult<()> {
         self.dummy()
     }
 
-    pub async fn on_strict_mode_config_update(&mut self) {}
+    pub fn on_strict_mode_config_update(&mut self) {}
 
     pub fn get_telemetry_data(&self) -> LocalShardTelemetry {
         LocalShardTelemetry {
@@ -94,8 +80,12 @@ impl DummyShard {
         self.dummy()
     }
 
+    pub fn dummy_error(&self) -> CollectionError {
+        CollectionError::service_error(self.message.clone())
+    }
+
     fn dummy<T>(&self) -> CollectionResult<T> {
-        Err(CollectionError::service_error(self.message.clone()))
+        Err(self.dummy_error())
     }
 }
 

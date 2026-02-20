@@ -6,12 +6,12 @@ use std::sync::atomic::AtomicBool;
 
 use bitvec::prelude::BitSlice;
 use common::counter::hardware_counter::HardwareCounterCell;
+use common::fs::clear_disk_cache;
+use common::mmap;
+use common::mmap::AdviceSetting;
 use common::types::PointOffsetType;
 use fs_err as fs;
 use fs_err::{File, OpenOptions};
-use memory::fadvise::clear_disk_cache;
-use memory::madvise::AdviceSetting;
-use memory::mmap_ops;
 
 use crate::common::Flusher;
 use crate::common::operation_error::{OperationError, OperationResult, check_process_stopped};
@@ -368,14 +368,14 @@ fn write_vector_le<T: PrimitiveVectorElement + MmapEndianConvertible>(
     if cfg!(target_endian = "little") {
         // Safety: `T` implements zerocopy::IntoBytes.
         #[expect(deprecated, reason = "legacy code")]
-        let raw_bytes = unsafe { mmap_ops::transmute_to_u8_slice(vector) };
+        let raw_bytes = unsafe { mmap::transmute_to_u8_slice(vector) };
         writer.write_all(raw_bytes)
     } else {
         let mut encoded = Vec::with_capacity(vector.len());
         encoded.extend(vector.iter().map(|value| value.to_le_storage()));
         // Safety: `T` implements zerocopy::IntoBytes.
         #[expect(deprecated, reason = "legacy code")]
-        let raw_bytes = unsafe { mmap_ops::transmute_to_u8_slice(encoded.as_slice()) };
+        let raw_bytes = unsafe { mmap::transmute_to_u8_slice(encoded.as_slice()) };
         writer.write_all(raw_bytes)
     }
 }
@@ -387,9 +387,9 @@ mod tests {
 
     use atomic_refcell::AtomicRefCell;
     use common::counter::hardware_counter::HardwareCounterCell;
-    use itertools::Itertools;
     #[expect(deprecated, reason = "legacy code")]
-    use memory::mmap_ops::transmute_to_u8_slice;
+    use common::mmap::transmute_to_u8_slice;
+    use itertools::Itertools;
     use tempfile::Builder;
 
     use super::*;

@@ -6,12 +6,13 @@ use std::sync::Arc;
 use bitvec::prelude::BitSlice;
 use common::ext::BitSliceExt as _;
 use common::maybe_uninit::maybe_uninit_fill_from;
+use common::mmap;
+use common::mmap::{
+    Advice, AdviceSetting, MULTI_MMAP_IS_SUPPORTED, Madviseable, MmapBitSlice, MmapFlusher,
+};
 use common::types::PointOffsetType;
 use fs_err::{File, OpenOptions};
 use memmap2::Mmap;
-use memory::madvise::{Advice, AdviceSetting, Madviseable};
-use memory::mmap_ops::{self, MULTI_MMAP_IS_SUPPORTED};
-use memory::mmap_type::{MmapBitSlice, MmapFlusher};
 use parking_lot::Mutex;
 
 use crate::common::error_logging::LogError;
@@ -102,7 +103,7 @@ impl<T: PrimitiveVectorElement + MmapEndianConvertible> MmapDenseVectors<T> {
             )));
         }
 
-        let mmap = mmap_ops::open_read_mmap(vectors_path, madvise, populate)
+        let mmap = mmap::open_read_mmap(vectors_path, madvise, populate)
             .describe("Open mmap for reading")?;
 
         if mmap.len() < HEADER_SIZE {
@@ -145,7 +146,7 @@ impl<T: PrimitiveVectorElement + MmapEndianConvertible> MmapDenseVectors<T> {
 
         // Only open second mmap for sequential reads if supported
         let mmap_seq = if *MULTI_MMAP_IS_SUPPORTED {
-            let mmap_seq = mmap_ops::open_read_mmap(
+            let mmap_seq = mmap::open_read_mmap(
                 vectors_path,
                 AdviceSetting::Advice(Advice::Sequential),
                 populate,
@@ -167,7 +168,7 @@ impl<T: PrimitiveVectorElement + MmapEndianConvertible> MmapDenseVectors<T> {
         let deleted_mmap_size = deleted_mmap_size(num_vectors);
         ensure_mmap_file_size(deleted_path, DELETED_HEADER, Some(deleted_mmap_size as u64))
             .describe("Create mmap deleted file")?;
-        let deleted_mmap = mmap_ops::open_write_mmap(deleted_path, AdviceSetting::Global, false)
+        let deleted_mmap = mmap::open_write_mmap(deleted_path, AdviceSetting::Global, false)
             .describe("Open mmap deleted for writing")?;
 
         if deleted_mmap.len() < deleted_mmap_data_start() {

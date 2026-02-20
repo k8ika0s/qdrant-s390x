@@ -10,8 +10,6 @@ use std::str;
 
 use fs_err::File;
 use memmap2::Mmap;
-use memory::madvise::{AdviceSetting, Madviseable};
-use memory::mmap_ops::open_read_mmap;
 use ph::fmph::Function;
 #[cfg(any(test, feature = "testing"))]
 use rand::Rng as _;
@@ -20,6 +18,7 @@ use rand::rngs::StdRng;
 use zerocopy::little_endian::{U32 as LeU32, U64 as LeU64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
+use crate::mmap::{AdviceSetting, Madviseable, open_read_mmap};
 use crate::zeros::WriteZerosExt as _;
 
 type ValuesLen = u32;

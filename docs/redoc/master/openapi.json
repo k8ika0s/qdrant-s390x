@@ -1475,6 +1475,16 @@
             "schema": {
               "$ref": "#/components/schemas/WriteOrdering"
             }
+          },
+          {
+            "name": "timeout",
+            "in": "query",
+            "description": "Timeout for the operation",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
           }
         ],
         "requestBody": {
@@ -1669,6 +1679,16 @@
             "required": false,
             "schema": {
               "$ref": "#/components/schemas/WriteOrdering"
+            }
+          },
+          {
+            "name": "timeout",
+            "in": "query",
+            "description": "Timeout for the operation",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
             }
           }
         ],
@@ -3039,6 +3059,69 @@
         }
       }
     },
+    "/collections/{collection_name}/shards/{shard_id}/snapshot": {
+      "get": {
+        "tags": [
+          "Snapshots"
+        ],
+        "summary": "Download shard snapshot",
+        "description": "Stream the current state of a shard as a snapshot file",
+        "operationId": "stream_shard_snapshot",
+        "parameters": [
+          {
+            "name": "collection_name",
+            "in": "path",
+            "description": "Name of the collection",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "shard_id",
+            "in": "path",
+            "description": "Id of the shard",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Snapshot file",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/collections/{collection_name}/shards/{shard_id}/snapshots/upload": {
       "post": {
         "tags": [
@@ -4042,6 +4125,16 @@
             "required": false,
             "schema": {
               "$ref": "#/components/schemas/WriteOrdering"
+            }
+          },
+          {
+            "name": "timeout",
+            "in": "query",
+            "description": "Timeout for the operation",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
             }
           }
         ],
@@ -8339,13 +8432,6 @@
             "type": "integer",
             "format": "uint",
             "minimum": 0
-          },
-          "op_num": {
-            "description": "last operation number processed",
-            "type": "integer",
-            "format": "uint",
-            "minimum": 0,
-            "nullable": true
           }
         }
       },
@@ -12608,7 +12694,7 @@
             "description": "Update queue status",
             "anyOf": [
               {
-                "$ref": "#/components/schemas/UpdateQueueInfo"
+                "$ref": "#/components/schemas/ShardUpdateQueueInfo"
               },
               {
                 "nullable": true
@@ -13355,6 +13441,27 @@
           }
         ]
       },
+      "ShardUpdateQueueInfo": {
+        "type": "object",
+        "required": [
+          "length"
+        ],
+        "properties": {
+          "length": {
+            "description": "Number of elements in the queue",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "op_num": {
+            "description": "last operation number processed",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          }
+        }
+      },
       "RemoteShardTelemetry": {
         "type": "object",
         "required": [
@@ -13749,7 +13856,10 @@
           "responses": {
             "type": "object",
             "additionalProperties": {
-              "$ref": "#/components/schemas/OperationDurationStatistics"
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/components/schemas/OperationDurationStatistics"
+              }
             }
           }
         }
@@ -15499,6 +15609,9 @@
           },
           {
             "$ref": "#/components/schemas/SampleQuery"
+          },
+          {
+            "$ref": "#/components/schemas/RelevanceFeedbackQuery"
           }
         ]
       },
@@ -16096,6 +16209,96 @@
         "enum": [
           "random"
         ]
+      },
+      "RelevanceFeedbackQuery": {
+        "type": "object",
+        "required": [
+          "relevance_feedback"
+        ],
+        "properties": {
+          "relevance_feedback": {
+            "$ref": "#/components/schemas/RelevanceFeedbackInput"
+          }
+        }
+      },
+      "RelevanceFeedbackInput": {
+        "type": "object",
+        "required": [
+          "feedback",
+          "strategy",
+          "target"
+        ],
+        "properties": {
+          "target": {
+            "$ref": "#/components/schemas/VectorInput"
+          },
+          "feedback": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FeedbackItem"
+            }
+          },
+          "strategy": {
+            "$ref": "#/components/schemas/FeedbackStrategy"
+          }
+        }
+      },
+      "FeedbackItem": {
+        "type": "object",
+        "required": [
+          "example",
+          "score"
+        ],
+        "properties": {
+          "example": {
+            "$ref": "#/components/schemas/VectorInput"
+          },
+          "score": {
+            "type": "number",
+            "format": "float"
+          }
+        }
+      },
+      "FeedbackStrategy": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/NaiveFeedbackStrategy"
+          }
+        ]
+      },
+      "NaiveFeedbackStrategy": {
+        "type": "object",
+        "required": [
+          "naive"
+        ],
+        "properties": {
+          "naive": {
+            "$ref": "#/components/schemas/NaiveFeedbackStrategyParams"
+          }
+        }
+      },
+      "NaiveFeedbackStrategyParams": {
+        "type": "object",
+        "required": [
+          "a",
+          "b",
+          "c"
+        ],
+        "properties": {
+          "a": {
+            "type": "number",
+            "format": "float"
+          },
+          "b": {
+            "type": "number",
+            "format": "float",
+            "minimum": 0
+          },
+          "c": {
+            "type": "number",
+            "format": "float"
+          }
+        }
       },
       "QueryRequestBatch": {
         "type": "object",
@@ -16698,7 +16901,6 @@
       "ProgressTree": {
         "type": "object",
         "required": [
-          "children",
           "name"
         ],
         "properties": {

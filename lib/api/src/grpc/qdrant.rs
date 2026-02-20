@@ -1620,9 +1620,6 @@ pub struct UpdateQueueInfo {
     /// Number of elements in the queue
     #[prost(uint64, tag = "1")]
     pub length: u64,
-    /// last operation number processed
-    #[prost(uint64, optional, tag = "2")]
-    pub op_num: ::core::option::Option<u64>,
 }
 #[derive(serde::Serialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -4077,6 +4074,42 @@ pub struct UpdateShardCutoffPointRequest {
     #[prost(message, optional, tag = "3")]
     pub cutoff: ::core::option::Option<RecoveryPoint>,
 }
+#[derive(validator::Validate)]
+#[derive(serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetShardOptimizationsRequest {
+    /// Name of the collection
+    #[prost(string, tag = "1")]
+    #[validate(
+        length(min = 1, max = 255),
+        custom(function = "common::validation::validate_collection_name_legacy")
+    )]
+    pub collection_name: ::prost::alloc::string::String,
+    /// Id of the shard
+    #[prost(uint32, tag = "2")]
+    pub shard_id: u32,
+    /// Whether to include queued optimizations
+    #[prost(bool, tag = "3")]
+    pub with_queued: bool,
+    /// Limit for completed optimizations (0 means not included)
+    #[prost(uint32, optional, tag = "4")]
+    pub completed_limit: ::core::option::Option<u32>,
+    /// Whether to include idle segments
+    #[prost(bool, tag = "5")]
+    pub with_idle_segments: bool,
+}
+#[derive(serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetShardOptimizationsResponse {
+    /// JSON-serialized OptimizationsResponse
+    #[prost(bytes = "vec", tag = "1")]
+    pub optimizations_json: ::prost::alloc::vec::Vec<u8>,
+    /// Time spent to process
+    #[prost(double, tag = "2")]
+    pub time: f64,
+}
 /// Generated client implementations.
 pub mod collections_internal_client {
     #![allow(unused_variables, dead_code, missing_docs, clippy::let_unit_value)]
@@ -4304,6 +4337,37 @@ pub mod collections_internal_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        /// Get shard optimizations info
+        pub async fn get_shard_optimizations(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetShardOptimizationsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetShardOptimizationsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/qdrant.CollectionsInternal/GetShardOptimizations",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "qdrant.CollectionsInternal",
+                        "GetShardOptimizations",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -4351,6 +4415,14 @@ pub mod collections_internal_server {
             request: tonic::Request<super::UpdateShardCutoffPointRequest>,
         ) -> std::result::Result<
             tonic::Response<super::CollectionOperationResponse>,
+            tonic::Status,
+        >;
+        /// Get shard optimizations info
+        async fn get_shard_optimizations(
+            &self,
+            request: tonic::Request<super::GetShardOptimizationsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetShardOptimizationsResponse>,
             tonic::Status,
         >;
     }
@@ -4663,6 +4735,56 @@ pub mod collections_internal_server {
                     let fut = async move {
                         let inner = inner.0;
                         let method = UpdateShardCutoffPointSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/qdrant.CollectionsInternal/GetShardOptimizations" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetShardOptimizationsSvc<T: CollectionsInternal>(pub Arc<T>);
+                    impl<
+                        T: CollectionsInternal,
+                    > tonic::server::UnaryService<super::GetShardOptimizationsRequest>
+                    for GetShardOptimizationsSvc<T> {
+                        type Response = super::GetShardOptimizationsResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetShardOptimizationsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as CollectionsInternal>::get_shard_optimizations(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let inner = inner.0;
+                        let method = GetShardOptimizationsSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
@@ -6102,6 +6224,70 @@ pub struct ContextInput {
 #[derive(serde::Serialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RelevanceFeedbackInput {
+    /// The original query vector
+    #[prost(message, optional, tag = "1")]
+    #[validate(nested)]
+    pub target: ::core::option::Option<VectorInput>,
+    /// Previous results scored by the feedback provider.
+    #[prost(message, repeated, tag = "2")]
+    #[validate(nested)]
+    pub feedback: ::prost::alloc::vec::Vec<FeedbackItem>,
+    /// Formula and trained coefficients to use.
+    #[prost(message, optional, tag = "3")]
+    #[validate(nested)]
+    pub strategy: ::core::option::Option<FeedbackStrategy>,
+}
+#[derive(validator::Validate)]
+#[derive(serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FeedbackItem {
+    /// The id or vector from the original model
+    #[prost(message, optional, tag = "1")]
+    #[validate(nested)]
+    pub example: ::core::option::Option<VectorInput>,
+    /// Score for this vector as determined by the feedback provider
+    #[prost(float, tag = "2")]
+    pub score: f32,
+}
+#[derive(validator::Validate)]
+#[derive(serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FeedbackStrategy {
+    #[prost(oneof = "feedback_strategy::Variant", tags = "1")]
+    #[validate(nested)]
+    pub variant: ::core::option::Option<feedback_strategy::Variant>,
+}
+/// Nested message and enum types in `FeedbackStrategy`.
+pub mod feedback_strategy {
+    #[derive(serde::Serialize)]
+    #[allow(clippy::derive_partial_eq_without_eq)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Variant {
+        /// a * score + sim(confidence^b * c * delta)
+        #[prost(message, tag = "1")]
+        Naive(super::NaiveFeedbackStrategy),
+    }
+}
+#[derive(validator::Validate)]
+#[derive(serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct NaiveFeedbackStrategy {
+    #[prost(float, tag = "1")]
+    pub a: f32,
+    #[prost(float, tag = "2")]
+    #[validate(range(min = 0.0))]
+    pub b: f32,
+    #[prost(float, tag = "3")]
+    pub c: f32,
+}
+#[derive(validator::Validate)]
+#[derive(serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Formula {
     #[prost(message, optional, tag = "1")]
     #[validate(nested)]
@@ -6322,7 +6508,7 @@ pub struct Rrf {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Query {
-    #[prost(oneof = "query::Variant", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10")]
+    #[prost(oneof = "query::Variant", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11")]
     #[validate(nested)]
     pub variant: ::core::option::Option<query::Variant>,
 }
@@ -6362,6 +6548,9 @@ pub mod query {
         /// Parameterized reciprocal rank fusion
         #[prost(message, tag = "10")]
         Rrf(super::Rrf),
+        /// Search with feedback from some oracle.
+        #[prost(message, tag = "11")]
+        RelevanceFeedback(super::RelevanceFeedbackInput),
     }
 }
 #[derive(validator::Validate)]
@@ -10405,34 +10594,6 @@ pub struct ContextQuery {
 #[derive(serde::Serialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct FeedbackStrategy {
-    #[prost(oneof = "feedback_strategy::Variant", tags = "1")]
-    pub variant: ::core::option::Option<feedback_strategy::Variant>,
-}
-/// Nested message and enum types in `FeedbackStrategy`.
-pub mod feedback_strategy {
-    #[derive(serde::Serialize)]
-    #[allow(clippy::derive_partial_eq_without_eq)]
-    #[derive(Clone, PartialEq, ::prost::Oneof)]
-    pub enum Variant {
-        #[prost(message, tag = "1")]
-        Naive(super::NaiveFeedbackStrategy),
-    }
-}
-#[derive(serde::Serialize)]
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct NaiveFeedbackStrategy {
-    #[prost(float, tag = "1")]
-    pub a: f32,
-    #[prost(float, tag = "2")]
-    pub b: f32,
-    #[prost(float, tag = "3")]
-    pub c: f32,
-}
-#[derive(serde::Serialize)]
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct QueryEnum {
     #[prost(oneof = "query_enum::Query", tags = "1, 2, 3, 4, 5")]
     pub query: ::core::option::Option<query_enum::Query>,
@@ -10634,14 +10795,14 @@ pub mod raw_query {
         #[prost(message, optional, tag = "1")]
         pub target: ::core::option::Option<super::RawVector>,
         #[prost(message, repeated, tag = "2")]
-        pub feedback: ::prost::alloc::vec::Vec<FeedbackItem>,
+        pub feedback: ::prost::alloc::vec::Vec<RawFeedbackItem>,
         #[prost(message, optional, tag = "3")]
         pub strategy: ::core::option::Option<super::FeedbackStrategy>,
     }
     #[derive(serde::Serialize)]
     #[allow(clippy::derive_partial_eq_without_eq)]
     #[derive(Clone, PartialEq, ::prost::Message)]
-    pub struct FeedbackItem {
+    pub struct RawFeedbackItem {
         #[prost(message, optional, tag = "1")]
         pub vector: ::core::option::Option<super::RawVector>,
         #[prost(float, tag = "2")]

@@ -4,14 +4,15 @@ use std::path::PathBuf;
 
 use bitvec::vec::BitVec;
 use common::counter::hardware_counter::HardwareCounterCell;
+use common::fs::{atomic_save, clear_disk_cache};
+use common::mmap;
+use common::mmap::{
+    Advice, AdviceSetting, Madviseable as _, MmapBitSlice, MmapSlice, create_and_ensure_length,
+    open_write_mmap,
+};
 use common::mmap_hashmap::{MmapHashMap, READ_ENTRY_OVERHEAD};
 use common::types::PointOffsetType;
 use itertools::Either;
-use io::file_operations::atomic_save;
-use memory::fadvise::clear_disk_cache;
-use memory::madvise::AdviceSetting;
-use memory::mmap_ops;
-use memory::mmap_type::MmapBitSlice;
 use mmap_postings::{MmapPostingValue, MmapPostings};
 
 use super::immutable_inverted_index::ImmutableInvertedIndex;
@@ -179,10 +180,10 @@ impl PointToTokensCount {
         let len = iter.len();
         let file_len = POINT_TO_TOKENS_COUNT_HEADER_SIZE + len * std::mem::size_of::<u32>();
 
-        let _file = mmap_ops::create_and_ensure_length(path, file_len)?;
-        let mut mmap = mmap_ops::open_write_mmap(
+        let _file = create_and_ensure_length(path, file_len)?;
+        let mut mmap = open_write_mmap(
             path,
-            AdviceSetting::Advice(memory::madvise::Advice::Normal), // sequential write
+            AdviceSetting::Advice(Advice::Normal), // sequential write
             false,
         )?;
 
@@ -291,7 +292,7 @@ impl PointToTokensCount {
             Self::migrate_legacy(path, &legacy_mmap)?;
         }
 
-        let mmap = mmap_ops::open_write_mmap(path, AdviceSetting::Global, populate)?;
+        let mmap = open_write_mmap(path, AdviceSetting::Global, populate)?;
         let len = Self::validate_header(&mmap)?;
         Ok(Self { mmap, len })
     }
@@ -338,7 +339,6 @@ impl PointToTokensCount {
     }
 
     pub fn populate(&self) -> std::io::Result<()> {
-        use memory::madvise::Madviseable as _;
         self.mmap.populate();
         Ok(())
     }
@@ -432,8 +432,7 @@ impl MmapInvertedIndex {
 
         let point_to_tokens_count = PointToTokensCount::open(&point_to_tokens_count_path, populate)?;
 
-        let deleted =
-            mmap_ops::open_write_mmap(&deleted_points_path, AdviceSetting::Global, populate)?;
+        let deleted = mmap::open_write_mmap(&deleted_points_path, AdviceSetting::Global, populate)?;
         let deleted = MmapBitSlice::from(deleted, 0);
 
         let num_deleted_points = deleted.count_ones();
@@ -898,4 +897,3 @@ mod tests {
         }
     }
 }
-
